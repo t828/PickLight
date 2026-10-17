@@ -2659,9 +2659,9 @@ namespace PickLight
                 bool ok = false; string err = "未知错误";
                 try
                 {
-                    if (_updateRepo == UpdateRepoDefault)
+                    if (_updateRepo.Length == 0)
                     {
-                        err = "更新源未配置（程序内置占位）。\n待作者发布带更新源的版本后即可检查更新。";
+                        err = "更新源未配置（程序内置为空）。\n待作者发布带更新源的版本后即可检查更新。";
                     }
                     else
                     {
@@ -2796,7 +2796,7 @@ namespace PickLight
             root.Children.Add(new TextBlock { Text = "设置", FontSize = 15, FontWeight = FontWeights.SemiBold, Foreground = theme, Margin = new Thickness(0, 0, 0, 12) });
 
             // 更新源状态（只读展示：更新源由程序内置，发布时在代码常量配置，不可修改）
-            bool configured = _updateRepo != UpdateRepoDefault;
+            bool configured = _updateRepo.Length > 0;
             root.Children.Add(new TextBlock
             {
                 Text = configured ? "更新源：" + _updateRepo : "更新源：未配置",
