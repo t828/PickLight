@@ -2672,7 +2672,8 @@ namespace PickLight
                             string json = wc.DownloadString("https://api.github.com/repos/" + _updateRepo + "/releases/latest");
                             var mTag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
                             var mBody = Regex.Match(json, "\"body\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
-                            var mExe = Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.exe)\"");
+                            // 精确匹配 PickLight.exe 附件（Release 可能同时附带 ffplay.exe，不能取第一个 .exe）
+                            var mExe = Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]*PickLight\\.exe)\"");
                             if (mTag.Success) latest = mTag.Groups[1].Value;
                             if (mBody.Success) note = DecodeJsonStr(mBody.Groups[1].Value);
                             if (mExe.Success) exeUrl = mExe.Groups[1].Value;

@@ -101,7 +101,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File E:\project\doubao\拾光\bui
 
 
 
-* 附件区 **Attach binaries**：拖入 `PickLight.exe`
+* 附件区 **Attach binaries**：**必须同时上传两个文件**——
+  * `PickLight.exe`（主程序，更新检查/一键升级只下载它）
+  * `ffplay.exe`（webm 等视频播放组件，170MB，用户需与主程序同目录放置）
 
 * 点击 **Publish release**
 
@@ -150,7 +152,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File E:\project\doubao\拾光\bui
 
 * **版本号必须单调递增**：新 tag 比旧 tag 大才生效（1.0.1 > 1.0.0；1.0.10 > 1.0.9）。
 
-* **exe 名**：Release 里附件的 exe 文件名随意，程序会取第一个 `.exe` 附件下载。
+* **exe 名**：Release 里必须包含 `PickLight.exe`（程序更新精确匹配此文件名下载）；`ffplay.exe` 是播放组件需一并上传，但**不会被当作更新包**下载。
 
 * **自动更新开关**：用户可在 设置 里关闭「启动时自动检查更新」，关闭后手动「检查更新」仍可用；开关状态保存在 settings.ini（`AutoUpdate=0`）。
 

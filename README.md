@@ -15,7 +15,7 @@
 
 ## 使用方法
 
-1. 从 [Releases](https://github.com/t828/PickLight/releases) 下载最新版 `PickLight.exe`（需与 `ffplay.exe` 同目录）
+1. 从 [Releases](https://github.com/t828/PickLight/releases) 下载最新版 **`PickLight.exe`** 和 **`ffplay.exe`**（webm 等视频播放组件），两个文件放到**同一目录**
 2. 打开程序，把base缓存文件拖入窗口，或点「选择文件夹 / 选择文件」
 3. 在列表中找到目标链接：预览查看、复制地址、或直接下载
 
@@ -27,7 +27,7 @@
 ## 在线更新
 
 - 程序内置更新源为 `t828/PickLight`（GitHub Releases）
-- 每次发布新版：在 Releases 创建 `vX.Y.Z` 标签并附带 `PickLight.exe`，用户端检查到更高版本即可一键更新
+- 每次发布新版：在 Releases 创建 `vX.Y.Z` 标签并附带 `PickLight.exe`（主程序）与 `ffplay.exe`（播放组件）；用户端检查到更高版本只下载 `PickLight.exe` 完成一键更新
 
 ## 构建
 
