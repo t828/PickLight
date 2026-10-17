@@ -400,7 +400,7 @@ namespace PickLight
                 IsChecked = true,
                 VerticalAlignment = VerticalAlignment.Center, FontSize = 13,
                 Foreground = (Brush)FindResource("TextSecondary"),
-                ToolTip = "勾选后：扫描文件夹时仅处理文件名以 data_ 或 f_ 开头的缓存文件（米哈游启动器缓存命名规则），其余文件自动跳过。\n取消勾选：扫描文件夹下全部文件。\n选择单个文件导入或拖入文件不受此选项影响。"
+                ToolTip = "勾选后：扫描文件夹时仅处理文件名以 data_ 或 f_ 开头的缓存文件（游戏启动器缓存文件常见命名），其余文件自动跳过。\n取消勾选：扫描文件夹下全部文件。\n选择单个文件导入或拖入文件不受此选项影响。"
             };
             row2.Children.Add(_filterCache);
 
@@ -1300,8 +1300,8 @@ namespace PickLight
         string ClassifySource(string url)
         {
             string u = url.ToLowerInvariant();
-            if (u.Contains("mihoyo") || u.Contains("launcher-webstatic")) return "米哈游启动器";
-            if (u.Contains("hoyoverse")) return "HoYoverse";
+            if (u.Contains("mihoyo") || u.Contains("launcher-webstatic")) return "启动器缓存";
+            if (u.Contains("hoyoverse")) return "游戏缓存";
             if (u.Contains("wegame") || u.Contains("tencent")) return "腾讯/WeGame";
             if (u.Contains("mi.com") || u.Contains("xiaomi")) return "小米";
             var dm = Regex.Match(url, @"https?://([^/]+)", RegexOptions.IgnoreCase);
