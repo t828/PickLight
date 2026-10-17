@@ -2793,7 +2793,6 @@ namespace PickLight
             dlg.PreviewKeyDown += (s2, e2) => { if (e2.Key == Key.Escape) dlg.Close(); }; // ESC 关闭
             var root = new StackPanel { Margin = new Thickness(20, 16, 20, 14) };
             var theme = new SolidColorBrush(Color.FromRgb(15, 118, 110));
-            root.Children.Add(new TextBlock { Text = "设置", FontSize = 15, FontWeight = FontWeights.SemiBold, Foreground = theme, Margin = new Thickness(0, 0, 0, 12) });
 
             // 更新源状态（只读展示：更新源由程序内置，发布时在代码常量配置，不可修改）
             bool configured = _updateRepo.Length > 0;
@@ -2815,6 +2814,17 @@ namespace PickLight
                     Margin = new Thickness(0, 0, 0, 8)
                 });
 
+            // 更新结果（就地显示检查状态/结果，不弹系统提示框）
+            var updateResult = new TextBlock
+            {
+                Text = "",
+                FontSize = 12.5,
+                Foreground = (Brush)FindResource("TextSecondary"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 2, 0, 4)
+            };
+            root.Children.Add(updateResult);
+
             // 自动更新开关
             var chkAuto = new CheckBox { Content = "启动时自动检查更新", IsChecked = _autoUpdate, FontSize = 13, Foreground = (Brush)FindResource("TextPrimary"), Margin = new Thickness(0, 8, 0, 0) };
             chkAuto.Checked += (s, e) => { _autoUpdate = true; SaveWindowState(); };
@@ -2828,9 +2838,33 @@ namespace PickLight
                 Margin = new Thickness(0, 4, 0, 0)
             });
 
+            // 关于：分隔线 + 开源授权说明 + GitHub 项目地址（点击打开浏览器）
+            root.Children.Add(new System.Windows.Shapes.Rectangle { Height = 1, Fill = new SolidColorBrush(Color.FromRgb(226, 232, 240)), Margin = new Thickness(0, 14, 0, 10) });
+            root.Children.Add(new TextBlock
+            {
+                Text = "本工具为开源软件，源代码使用 MIT 协议授权",
+                FontSize = 12,
+                Foreground = (Brush)FindResource("TextSecondary")
+            });
+            var linkTb = new TextBlock { FontSize = 12, Margin = new Thickness(0, 3, 0, 0) };
+            var linkRun = new Run("GitHub: https://github.com/t828/PickLight");
+            var link = new Hyperlink(linkRun)
+            {
+                Foreground = theme,
+                Cursor = Cursors.Hand,
+                TextDecorations = null
+            };
+            link.Click += (s, e) =>
+            {
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = "https://github.com/t828/PickLight", UseShellExecute = true }); }
+                catch { }
+            };
+            linkTb.Inlines.Add(link);
+            root.Children.Add(linkTb);
+
             var btnRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 14, 0, 0), HorizontalAlignment = HorizontalAlignment.Right };
             var btnCheck = MakeBtn("检查更新", PrimaryButtonStyle(13.0), 110, 38);
-            btnCheck.Click += (s, e) => CheckUpdate(true);
+            btnCheck.Click += (s, e) => CheckUpdateInDialog(updateResult, btnCheck, dlg);
             var btnClose = MakeBtn("关闭", (Style)FindResource("ToolButton"), 110, 38);
             btnClose.Click += (s, e) => dlg.Close();
             btnCheck.Margin = new Thickness(0, 0, 8, 0);
@@ -2838,6 +2872,78 @@ namespace PickLight
             root.Children.Add(btnRow);
             dlg.Content = root;
             dlg.ShowDialog();
+        }
+
+        // 设置弹窗内的检查更新：结果就地显示在弹窗里（点击→"正在检查更新…"→显示结果），不弹系统提示框；
+        // 发现新版本时关闭设置弹窗并打开升级确认弹窗
+        void CheckUpdateInDialog(TextBlock result, Button btn, Window dlg)
+        {
+            btn.IsEnabled = false;
+            var themeBrush = new SolidColorBrush(Color.FromRgb(15, 118, 110));
+            result.Text = "正在检查更新…";
+            result.Foreground = (Brush)FindResource("TextSecondary");
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                string latest = "", note = "", exeUrl = "";
+                bool ok = false; string err = "未知错误";
+                try
+                {
+                    if (_updateRepo.Length == 0)
+                    {
+                        err = "更新源未配置（程序内置为空）。";
+                    }
+                    else
+                    {
+                        using (var wc = new System.Net.WebClient())
+                        {
+                            wc.Headers[System.Net.HttpRequestHeader.UserAgent] = "PickLight-Updater";
+                            wc.Headers[System.Net.HttpRequestHeader.Accept] = "application/vnd.github+json";
+                            string json = wc.DownloadString("https://api.github.com/repos/" + _updateRepo + "/releases/latest");
+                            var mTag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
+                            var mBody = Regex.Match(json, "\"body\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+                            var mExe = Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]*PickLight\\.exe)\"");
+                            if (mTag.Success) latest = mTag.Groups[1].Value;
+                            if (mBody.Success) note = DecodeJsonStr(mBody.Groups[1].Value);
+                            if (mExe.Success) exeUrl = mExe.Groups[1].Value;
+                            ok = true;
+                        }
+                    }
+                }
+                catch (Exception ex) { err = ex.Message; ok = false; }
+
+                string tag = latest, desc = note, url = exeUrl;
+                bool fetched = ok; string errMsg = err;
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    btn.IsEnabled = true;
+                    if (!fetched)
+                    {
+                        result.Text = "检查更新失败：" + errMsg;
+                        result.Foreground = new SolidColorBrush(Color.FromRgb(220, 38, 38));
+                        return;
+                    }
+                    Version curV = null, newV = null;
+                    Version.TryParse(AppVersion.TrimStart('v', 'V'), out curV);
+                    Version.TryParse(tag.TrimStart('v', 'V'), out newV);
+                    bool hasNew = curV != null && newV != null && newV > curV;
+                    if (!hasNew)
+                    {
+                        result.Text = "已是最新版本 v" + AppVersion;
+                        result.Foreground = themeBrush;
+                        return;
+                    }
+                    if (url.Length == 0)
+                    {
+                        result.Text = "发现新版本 v" + tag + "，但该版本未附带 PickLight.exe，请到 GitHub Releases 页面手动下载。";
+                        result.Foreground = themeBrush;
+                        return;
+                    }
+                    result.Text = "发现新版本 v" + tag + "，正在打开更新窗口…";
+                    result.Foreground = themeBrush;
+                    dlg.Close();
+                    ShowUpdateDialog(tag, desc, url);
+                }));
+            });
         }
 
         // 下载新版 exe → 提示重启 → 写替换批处理（等本进程退出后覆盖 exe 再重新启动）
