@@ -1,0 +1,12 @@
+# 构建产物 / 外置组件（通过 Releases 发布，不入库）
+PickLight.exe
+ffplay.exe
+*.exe
+
+# 用户数据 / 本地配置（不入库）
+links_history.txt
+settings.ini
+error.log
+
+# 更新替换临时文件
+update_tmp.bat
