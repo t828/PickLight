@@ -1,6 +1,7 @@
 # 构建产物 / 外置组件（通过 Releases 发布，不入库）
 PickLight.exe
 ffplay.exe
+GitHub发布流程.md
 *.exe
 
 # 用户数据 / 本地配置（不入库）
