@@ -91,7 +91,7 @@ namespace PickLight
         TextBlock _countText;
         CheckBox _filterCache;
         // ---- 在线更新（GitHub Releases）----
-        const string AppVersion = "1.0.0"; // 当前版本号（更新检查基准）
+        const string AppVersion = "1.0.1"; // 当前版本号（更新检查基准）
         const string UpdateRepoDefault = "t828/PickLight"; // GitHub 仓库(owner/repo)：更新源，发布时在此配置
         string _updateRepo = UpdateRepoDefault;
         bool _autoUpdate = true; // 启动时自动检查更新（settings.ini 的 AutoUpdate=0 可关闭，手动「检查更新」按钮始终可用）
