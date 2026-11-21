@@ -3774,7 +3774,7 @@ namespace PickLight
                     "setlocal\r\n" +
                     "set LOG=\"" + log + "\"\r\n" +
                     "echo [%DATE% %TIME%] begin replace >> %LOG% 2>&1\r\n" +
-                    "timeout /t 2 /nobreak >nul\r\n" +
+                    "ping -n 3 127.0.0.1 >nul\r\n" +
                     "taskkill /im PickLight.exe /f >> %LOG% 2>&1\r\n" +
                     "set /a W=0\r\n" +
                     ":wait\r\n" +
@@ -3805,7 +3805,17 @@ namespace PickLight
                     ":quit\r\n" +
                     "del /f /q \"" + bat + "\" >nul 2>&1\r\n",
                     new System.Text.UTF8Encoding(false));
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = bat, WorkingDirectory = dir, UseShellExecute = true });
+                // 隐藏窗口启动：UseShellExecute=true 会弹出可见的 cmd 黑窗，改用 CreateNoWindow 直接跑
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = "/c \"\"" + bat + "\"\"",
+                    WorkingDirectory = dir,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+                };
+                System.Diagnostics.Process.Start(psi);
                 Close(); // 关闭主窗口（触发 Closing → 保存历史/窗口状态）
             }
             catch (Exception ex)
