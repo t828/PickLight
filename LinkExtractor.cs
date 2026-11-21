@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
@@ -39,6 +39,7 @@ namespace PickLight
         public string Note { get; set; }
         public string Batch { get; set; } // 导入批次名：每次导入归入一批，可按批次筛选查看新旧
         public string ImportTime { get; set; } // 该记录导入到工具的时间（yyyy-MM-dd HH:mm:ss），批次导入日期取其最大值（覆盖导入自动更新）
+        public string SourceFile { get; set; } // 记录来源文件的绝对路径：用于「重新获取」时回读原文件，取到最新链接
         string _status;
         public string Status
         {
@@ -97,6 +98,11 @@ namespace PickLight
         bool _updatingGrid = false;
         int _newCount = 0;
         int _dupCount = 0;
+        int _lockedCount = 0; // 被其他程序独占、连临时副本也复制不了的缓存文件数
+        int _srcTaggedCount = 0; // 本次导入为"已存在记录"补记来源文件的条数（用来解释"没新增但有来源"）
+        // 「重新获取」最近一次的结构化结果：结果弹窗按"指标"排版（数字大、单位小），不再堆成一段文字
+        int _rbFiles = 0, _rbAdded = 0, _rbSkipped = 0, _rbMissing = 0, _rbLocked = 0;
+        InputFocusGuard _inputGuard; // 主窗口的输入框焦点治理（与各弹窗共用同一套规则）
         MediaElement _currentMedia; // 预览窗口当前内嵌播放的媒体
         System.Diagnostics.Process _currentFfplay; // 预览窗口当前启动的 ffplay 播放进程
         IntPtr _embeddedHwnd; // 伪嵌入：当前叠放在预览弹窗内容区上的 ffplay 窗口句柄（随弹窗移动/缩放同步）
@@ -105,9 +111,24 @@ namespace PickLight
         [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
         static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags);
 
+        // 预览弹窗整体断开输入法（imm32）：缩放比例输入是纯数字不需要中文输入法，
+        // 断开后弹窗内按 W/A/S/D/R 等字母键不会触发输入法候选/被吞，键盘快捷键稳定可用
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern IntPtr ImmAssociateContext(IntPtr hWnd, IntPtr hIMC);
+        // 主动取消输入法正在进行的拼音组合：输入框失焦后若不取消，候选选字仍会被灌回原输入框
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern IntPtr ImmGetContext(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern bool ImmNotifyIME(IntPtr hIMC, int action, int index, int value);
+
         // 预览图片区交互（拖动/双击）：WndProc 钩子用——客户区坐标转屏幕坐标
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         static extern bool ClientToScreen(IntPtr hwnd, ref POINT pt);
+        // 退出比例输入时把键盘焦点真正还给窗口（仅 ClearFocus 只清 WPF 逻辑焦点，物理焦点仍留在输入框）
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr SetFocus(IntPtr hwnd);
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
         public struct POINT { public int X; public int Y; }
 
@@ -123,7 +144,7 @@ namespace PickLight
         {
             _historyPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "links_history.txt");
             _settingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini");
-            Title = "拾光 v" + AppVersion;
+            Title = "PickLight v" + AppVersion;
             // 启动时激活窗口，避免被其他软件（如豆包）遮挡导致点击落到别的窗口；
             // 启动 1.5 秒后后台静默检查更新（仅当设置允许自动检查；发现新版本才弹窗）
             Loaded += (s, e) =>
@@ -170,6 +191,14 @@ namespace PickLight
             Grid.SetRow(root.Children[3], 3);
 
             Content = root;
+
+            // 输入法彻底失焦：文本框失焦时同时断开本窗口的 IME 关联（并非只清焦点）。
+            // 只清焦点/清逻辑焦点时，输入法组合仍绑在旧输入框，按键照样被它吃掉（"高亮没了但还能打字"）。
+            // 输入框焦点统一治理：主窗口与各个弹窗装的是同一套规则（见文件末尾 InputFocusGuard）
+            // 1) 文本框获焦恢复本窗口输入法、失焦断开输入法（候选窗不再吞掉快捷键）
+            // 2) 点击输入框以外区域立即失焦：边框高亮/光标消失，后续按键不会继续落进原输入框
+            _inputGuard = new InputFocusGuard(this, root);
+            _inputGuard.Attach();
 
             // DPI 感知
             try { System.Windows.Media.VisualTreeHelper.GetDpi(this); } catch { }
@@ -282,7 +311,7 @@ namespace PickLight
         FrameworkElement BuildHeader()
         {
             // 头部：左侧 标识 + 操作提示；右侧 设置按钮悬浮右上角（主题色填充，与工具栏操作按钮区分）。
-            // 窗口标题已含"拾光 v1.0.0"，此处不再重复品牌文字，避免与标题重复
+            // 窗口标题已含"PickLight v1.0.0"，此处不再重复品牌文字，避免与标题重复
             var dock = new DockPanel { Margin = new Thickness(20, 12, 20, 6), LastChildFill = false };
             var left = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             var logo = new Border
@@ -290,7 +319,7 @@ namespace PickLight
                 Width = 34, Height = 34, CornerRadius = new CornerRadius(9),
                 Background = new SolidColorBrush(Color.FromRgb(15, 118, 110))
             };
-            var logoText = new TextBlock { Text = "拾", FontSize = 16, FontWeight = FontWeights.SemiBold, Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+            var logoText = new TextBlock { Text = "P", FontSize = 17, FontWeight = FontWeights.SemiBold, Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
             logo.Child = logoText;
             var sub = new TextBlock
             {
@@ -340,8 +369,7 @@ namespace PickLight
             btnClear.Click += (s, e) =>
             {
                 if (_items.Count == 0) { SetStatus("当前没有可清空的记录。"); return; }
-                var r = System.Windows.MessageBox.Show(this, "确定清空全部 " + _items.Count + " 条记录？此操作不可恢复。", "拾光", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-                if (r != MessageBoxResult.Yes) return;
+                if (!ShowConfirm("清空全部记录", "确定清空全部 " + _items.Count + " 条记录？此操作不可恢复。", "清空", true)) return;
                 _items.Clear(); _seen.Clear(); SaveHistory(); UpdateCount(); SetStatus("已清空，可拖入新文件。");
             };
 
@@ -371,16 +399,16 @@ namespace PickLight
 
             // 筛选下拉框统一走公共工厂（样式/尺寸/对齐一处定义）
             _typeFilter = MakeFilterCombo(112);
-            _typeFilter.Items.Add(MakeBatchItem("全部类型"));
-            _typeFilter.Items.Add(MakeBatchItem("视频"));
-            _typeFilter.Items.Add(MakeBatchItem("图片"));
-            _typeFilter.Items.Add(MakeBatchItem("音频"));
+            _typeFilter.Items.Add(MakeCountItem("全部类型", 0));
+            _typeFilter.Items.Add(MakeCountItem("视频", 0));
+            _typeFilter.Items.Add(MakeCountItem("图片", 0));
+            _typeFilter.Items.Add(MakeCountItem("音频", 0));
             _typeFilter.SelectedIndex = 0;
             _typeFilter.SelectionChanged += TypeFilterChanged;
             row2.Children.Add(_typeFilter);
 
             _srcFilter = MakeFilterCombo(152);
-            _srcFilter.Items.Add(MakeBatchItem("全部来源"));
+            _srcFilter.Items.Add(MakeCountItem("全部来源", 0));
             _srcFilter.SelectedIndex = 0;
             _srcFilter.SelectionChanged += SrcFilterChanged;
             row2.Children.Add(_srcFilter);
@@ -1041,15 +1069,31 @@ namespace PickLight
             var d = new System.Windows.Forms.OpenFileDialog();
             d.Multiselect = true;
             d.Title = "选择一个或多个缓存文件";
+            // 缓存文件常被游戏/启动器以读写方式占着。系统对话框默认会校验"文件可打开"，
+            // 一选中被占用的 data_* 就弹"该文件正在使用"，根本回不到本程序。
+            // 关掉存在性/名称校验，让路径直接回给程序，由程序自己以 FileShare.ReadWrite 读取（读不了再复制临时副本）。
+            d.CheckFileExists = false;
+            d.ValidateNames = false;
+            d.DereferenceLinks = false;
+            d.RestoreDirectory = true;
             if (d.ShowDialog() == System.Windows.Forms.DialogResult.OK)
                 foreach (var f in d.FileNames) ProcessPath(f);
+        }
+
+        string LockedTip()
+        {
+            // 游戏/启动器运行时会以独占方式锁住 data_* 缓存：直接读、复制临时副本都会被拒。
+            // 与其静默算 0 条，不如在状态栏明确说明原因和出路
+            return _lockedCount > 0
+                ? " · " + _lockedCount + " 个文件正被其他程序独占无法读取（关闭游戏/启动器后重试）"
+                : "";
         }
 
         void ProcessPath(string path)
         {
             try
             {
-                _newCount = 0; _dupCount = 0;
+                _newCount = 0; _dupCount = 0; _lockedCount = 0; _srcTaggedCount = 0;
                 var pending = new List<LinkItem>(); // 本次扫描的新记录缓冲：确认批次后才真正加入列表
                 if (Directory.Exists(path))
                 {
@@ -1057,12 +1101,12 @@ namespace PickLight
                     if (_filterCache.IsChecked == true)
                         files = files.Where(f => Regex.IsMatch(System.IO.Path.GetFileName(f), @"^(data_|f_)", RegexOptions.IgnoreCase)).ToArray();
                     foreach (var f in files) ScanFile(f, pending);
-                    SetStatus("已扫描文件夹 " + path + "，处理文件 " + files.Length + " 个 · 新增 " + _newCount + " 条，跳过重复 " + _dupCount + " 条");
+                    SetStatus("已扫描文件夹 " + path + "，处理文件 " + files.Length + " 个 · 新增 " + _newCount + " 条，跳过重复 " + _dupCount + " 条" + LockedTip());
                 }
                 else if (File.Exists(path))
                 {
                     ScanFile(path, pending);
-                    SetStatus("已扫描文件：" + path + " · 新增 " + _newCount + " 条，跳过重复 " + _dupCount + " 条");
+                    SetStatus("已扫描文件：" + path + " · 新增 " + _newCount + " 条，跳过重复 " + _dupCount + " 条" + LockedTip());
                 }
                 else SetStatus("路径不存在：" + path);
 
@@ -1089,18 +1133,262 @@ namespace PickLight
                     string importNow = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                     foreach (var it in pending) { if (it.Url.Length == 0) continue; it.Batch = batch; it.ImportTime = importNow; _items.Add(it); validCnt++; }
                     SetStatus("已导入 " + validCnt + " 条 → 记录「" + batch + "」（合并/新建完成，可切换记录筛选查看）");
+                    // 部分成功、部分被独占时也要明确告知，否则用户会以为文件里的数据都进来了
+                    if (_lockedCount > 0)
+                        ShowStatsNotice("部分文件无法读取", batch,
+                            new string[] { "已导入", "无法读取" },
+                            new int[] { validCnt, _lockedCount },
+                            new string[] { "条", "个" },
+                            "这些文件正被其他程序独占（游戏/启动器在运行），内容读不到。\n"
+                            + "请先关闭游戏/启动器，再在「记录管理 → 重新获取」回读该分组，或重新导入这些文件。", true);
                 }
                 else
                 {
                     // 没提取到新记录：明显提示（弹窗），避免用户以为导入成功了
-                    // 模态提示（Owner=主窗口）：弹窗期间主窗口不可操作，避免误点其他功能
-                    System.Windows.MessageBox.Show(this, "本次未提取到新记录：新增 0 条，跳过重复 " + _dupCount + " 条。\n请确认所选文件/文件夹中包含 webm / mp4 / png / jpg 等媒体链接。",
-                        "拾光", MessageBoxButton.OK, MessageBoxImage.Information);
-                    SetStatus("未提取到新记录：新增 0 条，跳过重复 " + _dupCount + " 条。");
+                    var labels = new List<string> { "新增", "跳过重复" };
+                    var nums = new List<int> { 0, _dupCount };
+                    var units = new List<string> { "条", "条" };
+                    if (_lockedCount > 0) { labels.Add("无法读取"); nums.Add(_lockedCount); units.Add("个"); }
+                    string note = "";
+                    if (_srcTaggedCount > 0)
+                        note += "已把本次选择的文件登记为这些记录（" + _srcTaggedCount + " 条）的来源，"
+                              + "之后可在「记录管理」对该分组点「重新获取」检查更新。";
+                    else if (_lockedCount == 0)
+                        note = _dupCount > 0
+                            ? "文件里的链接都已经在记录里了，没有可新增的内容。"
+                            : "请确认所选文件/文件夹中包含 webm / mp4 / png / jpg 等媒体链接。";
+                    if (_lockedCount > 0)
+                        note += (note.Length > 0 ? "\n" : "") + "这些文件正被其他程序独占（游戏/启动器在运行），请关闭后重试。";
+                    ShowStatsNotice("未提取到新记录", "", labels.ToArray(), nums.ToArray(), units.ToArray(), note, _lockedCount > 0);
+                    SetStatus("未提取到新记录：新增 0 条，跳过重复 " + _dupCount + " 条。" + LockedTip());
                 }
                 SaveHistory(); UpdateCount(); ApplyFilter(); RebuildBatchFilter();
             }
             catch (Exception ex) { SetStatus("扫描出错：" + ex.Message); }
+        }
+
+        // ---------- 统一弹窗外观：窗口 / 白卡 / 标题 / 正文 / 按钮行 / 键盘，只在这里定义一次 ----------
+        // 所有提示、确认、结果弹窗都走这套骨架，改圆角、边距、按钮尺寸只需改这一处
+        Window BuildCardDialog(string title, StackPanel content)
+        {
+            var win = new Window
+            {
+                Title = title,
+                Width = 470,
+                SizeToContent = SizeToContent.Height,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                ResizeMode = ResizeMode.NoResize,
+                ShowInTaskbar = false,
+                Background = (Brush)FindResource("AppBackground"),
+                FontFamily = FontFamily,
+                FontSize = 13.5
+            };
+            var card = new Border
+            {
+                Background = Brushes.White,
+                BorderBrush = new SolidColorBrush(Color.FromRgb(226, 232, 240)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(18, 16, 18, 14),
+                Margin = new Thickness(16)
+            };
+            card.Child = content;
+            win.Content = card;
+            return win;
+        }
+
+        // 标题配色：0=主题色（普通结果）1=警告橙（部分失败）2=危险红（不可恢复操作）
+        TextBlock MakeDialogTitle(string text, int kind, Thickness margin)
+        {
+            Color c = kind == 2 ? Color.FromRgb(185, 28, 28)
+                                : (kind == 1 ? Color.FromRgb(180, 83, 9) : Color.FromRgb(15, 118, 110));
+            return new TextBlock
+            {
+                Text = text,
+                FontSize = 14.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(c),
+                Margin = margin
+            };
+        }
+
+        TextBlock MakeDialogBody(string text, int kind)
+        {
+            Color c = kind == 1 ? Color.FromRgb(180, 83, 9) : Color.FromRgb(51, 65, 85);
+            return new TextBlock
+            {
+                Text = text,
+                FontSize = 13,
+                Foreground = new SolidColorBrush(c),
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 21
+            };
+        }
+
+        // 右下角按钮行：取消在左（白底）、主操作在右；cancel 传 null 则只有一个按钮
+        StackPanel MakeDialogButtons(Button ok, Button cancel)
+        {
+            var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
+            if (cancel != null)
+            {
+                cancel.Margin = new Thickness(0, 0, 8, 0);
+                row.Children.Add(cancel);
+            }
+            row.Children.Add(ok);
+            return row;
+        }
+
+        // Esc 一律关闭；Enter 走调用方给的确认动作（危险操作传 null，避免回车误确认）
+        void BindDialogKeys(Window win, Action onEnter)
+        {
+            win.PreviewKeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Escape) win.Close();
+                else if (e.Key == Key.Enter && onEnter != null) onEnter();
+            };
+        }
+
+        // 统一的信息提示弹窗（单按钮）：与导入/记录管理/设置等弹窗同一套视觉
+        // （浅灰底 + 白色圆角卡片 + 主题色标题 + 主色按钮），替代风格割裂的系统 MessageBox
+        void ShowNotice(string title, string body, bool warning)
+        {
+            ShowDialogNotice(title, body, warning, "确定", false);
+        }
+
+        // 同一个提示弹窗的可交互版本：showCancel=true 时右下角多一个"取消"，
+        // 返回 true 表示点击了主操作按钮（用于"先征求同意再打开文件选择框"这类流程）
+        bool ShowDialogNotice(string title, string body, bool warning, string okText, bool showCancel)
+        {
+            bool confirmed = false;
+            Window win = null;
+            var stack = new StackPanel();
+            stack.Children.Add(MakeDialogTitle(title, warning ? 1 : 0, new Thickness(0, 0, 0, 10)));
+            stack.Children.Add(MakeDialogBody(body, 0));
+            var btnOk = MakeBtn(okText, PrimaryButtonStyle(13.0), 96, 36); // 主操作：主题色
+            btnOk.Click += (s, e) => { confirmed = true; win.Close(); };
+            Button btnCancel = null;
+            if (showCancel)
+            {
+                btnCancel = MakeBtn("取消", (Style)FindResource("ToolButton"), 84, 36); // 次操作：白底
+                btnCancel.Click += (s, e) => { win.Close(); };
+            }
+            stack.Children.Add(MakeDialogButtons(btnOk, btnCancel));
+            win = BuildCardDialog(title, stack);
+            BindDialogKeys(win, () => { confirmed = true; win.Close(); });
+            win.ShowDialog();
+            return confirmed;
+        }
+
+        // 统一的确认弹窗（与提示弹窗同一套卡片视觉）：返回 true 表示用户确认执行
+        // danger=true 时按钮用危险红、标题用红色，且回车不触发确认（避免误操作）
+        bool ShowConfirm(string title, string body, string okText, bool danger)
+        {
+            bool confirmed = false;
+            Window win = null;
+            var stack = new StackPanel();
+            stack.Children.Add(MakeDialogTitle(title, danger ? 2 : 0, new Thickness(0, 0, 0, 10)));
+            stack.Children.Add(MakeDialogBody(body, 0));
+            var btnOk = MakeBtn(okText, danger ? DangerButtonStyle(13.0) : PrimaryButtonStyle(13.0), 96, 36); // 主操作
+            btnOk.Click += (s, e) => { confirmed = true; win.Close(); };
+            var btnCancel = MakeBtn("取消", (Style)FindResource("ToolButton"), 84, 36); // 次操作：白底
+            btnCancel.Click += (s, e) => { win.Close(); };
+            stack.Children.Add(MakeDialogButtons(btnOk, btnCancel));
+            win = BuildCardDialog(title, stack);
+            // 危险操作只认鼠标点击，回车不确认（避免误删）
+            Action enter = null;
+            if (!danger) enter = delegate { confirmed = true; win.Close(); };
+            BindDialogKeys(win, enter);
+            win.ShowDialog();
+            return confirmed;
+        }
+
+        // 结果型提示：标题 + 对象徽章 + 指标行（数字大/单位小）+ 可选的补充说明
+        // 用于「重新获取」「导入」这类有明确数量的结果，一眼就能看清新增/跳过/回读了多少
+        void ShowStatsNotice(string title, string subject, string[] labels, int[] nums, string[] units, string note, bool warning)
+        {
+            Window win = null;
+            var stack = new StackPanel();
+            // 第一行：标题 +（可选）对象徽章，避免把分组名混在正文里
+            var head = new StackPanel { Orientation = Orientation.Horizontal };
+            var titleBlock = MakeDialogTitle(title, warning ? 1 : 0, new Thickness(0));
+            titleBlock.VerticalAlignment = VerticalAlignment.Center;
+            head.Children.Add(titleBlock);
+            if (!string.IsNullOrEmpty(subject))
+            {
+                var badge = new Border
+                {
+                    Background = new SolidColorBrush(Color.FromRgb(240, 253, 250)),
+                    BorderBrush = new SolidColorBrush(Color.FromRgb(204, 251, 241)),
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(4),
+                    Padding = new Thickness(8, 2, 8, 2),
+                    Margin = new Thickness(10, 0, 0, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Child = new TextBlock { Text = subject, FontSize = 12, Foreground = new SolidColorBrush(Color.FromRgb(15, 118, 110)) }
+                };
+                head.Children.Add(badge);
+            }
+            stack.Children.Add(head);
+
+            // 指标区：上下各一条淡灰分隔线，与正文分层
+            stack.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromRgb(226, 232, 240)), Margin = new Thickness(0, 12, 0, 12) });
+            var stats = new Grid();
+            for (int i = 0; i < labels.Length; i++)
+            {
+                stats.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                var cell = new StackPanel { Margin = new Thickness(i == 0 ? 0 : 14, 0, 0, 0) };
+                cell.Children.Add(new TextBlock
+                {
+                    Text = labels[i],
+                    FontSize = 11.5,
+                    Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139)),
+                    Margin = new Thickness(0, 0, 0, 4)
+                });
+                // 数字与单位分开：数字大号强调、单位小号弱化
+                Color numColor = i == 0 ? Color.FromRgb(15, 118, 110)
+                                        : (i == 1 ? (nums[i] > 0 ? Color.FromRgb(21, 128, 61) : Color.FromRgb(148, 163, 184))
+                                                  : Color.FromRgb(71, 85, 105));
+                var val = new StackPanel { Orientation = Orientation.Horizontal };
+                val.Children.Add(new TextBlock
+                {
+                    Text = nums[i].ToString(),
+                    FontSize = 19,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = new SolidColorBrush(numColor)
+                });
+                val.Children.Add(new TextBlock
+                {
+                    Text = units[i],
+                    FontSize = 11.5,
+                    Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139)),
+                    Margin = new Thickness(3, 7, 0, 0)
+                });
+                cell.Children.Add(val);
+                Grid.SetColumn(cell, i);
+                stats.Children.Add(cell);
+            }
+            stack.Children.Add(stats);
+
+            if (!string.IsNullOrEmpty(note))
+            {
+                stack.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromRgb(241, 245, 249)), Margin = new Thickness(0, 12, 0, 10) });
+                stack.Children.Add(new TextBlock
+                {
+                    Text = note,
+                    FontSize = 12,
+                    LineHeight = 19,
+                    TextWrapping = TextWrapping.Wrap,
+                    Foreground = new SolidColorBrush(warning ? Color.FromRgb(180, 83, 9) : Color.FromRgb(100, 116, 139))
+                });
+            }
+
+            var btnOk = MakeBtn("确定", PrimaryButtonStyle(13.0), 84, 36);
+            btnOk.Click += (s, e) => win.Close();
+            stack.Children.Add(MakeDialogButtons(btnOk, null));
+            win = BuildCardDialog(title, stack);
+            BindDialogKeys(win, () => win.Close());
+            win.ShowDialog();
         }
 
         // 导入批次选择对话框：合并到已有批次 / 新建批次；返回 null 表示取消
@@ -1125,6 +1413,7 @@ namespace PickLight
             // ESC 关闭导入弹窗 = 取消导入
             win.PreviewKeyDown += (s2, e2) => { if (e2.Key == Key.Escape) win.Close(); };
             var root = new StackPanel { Margin = new Thickness(20, 16, 20, 14) };
+            new InputFocusGuard(win, root).Attach(); // 输入框焦点与主窗口同一套规则：点空白/列表即失焦
             var hintText = string.IsNullOrEmpty(sourceName)
                 ? "本次导入 " + count + " 条新记录，归入哪条记录？"
                 : "本次从「" + sourceName + "」提取 " + count + " 条新记录，归入哪条记录？";
@@ -1226,7 +1515,7 @@ namespace PickLight
                     }
                     try { File.Delete(tmp); } catch { }
                 }
-                catch { return; }
+                catch { _lockedCount++; return; }
             }
 
             string text;
@@ -1235,7 +1524,30 @@ namespace PickLight
             foreach (Match m in UrlRegex.Matches(text))
             {
                 string url = m.Value;
-                if (!_seen.Add(url)) { _dupCount++; continue; }
+                if (!_seen.Add(url))
+                {
+                    _dupCount++;
+                    // 重复导入同一批文件时，把「本次选择的文件」补记到已有记录上，
+                    // 这样即便一条新记录都没产生，该分组也会拥有来源文件，「重新获取」才能工作。
+                    // 多来源用 | 分隔（Windows 路径不允许该字符）
+                    for (int ri = 0; ri < _items.Count; ri++)
+                    {
+                        var rec = _items[ri];
+                        if (rec.Url != url) continue;
+                        if (string.IsNullOrEmpty(rec.SourceFile))
+                        {
+                            rec.SourceFile = file;
+                            _srcTaggedCount++;
+                        }
+                        else if (rec.SourceFile.IndexOf(file, StringComparison.OrdinalIgnoreCase) < 0)
+                        {
+                            rec.SourceFile += "|" + file;
+                            _srcTaggedCount++;
+                        }
+                        break;
+                    }
+                    continue;
+                }
                 _newCount++;
                 var it = new LinkItem();
                 it.Url = url;
@@ -1244,6 +1556,7 @@ namespace PickLight
                 var pd = PathDateRegex.Match(url);
                 if (pd.Success) it.Time = pd.Groups[1].Value + "-" + pd.Groups[2].Value + "-" + pd.Groups[3].Value;
                 it.Note = ""; it.Status = "";
+                it.SourceFile = file; // 记住来源文件，供「记录管理 → 重新获取」回读最新数据
                 pending.Add(it);
             }
 
@@ -1342,6 +1655,7 @@ namespace PickLight
                 _updatingGrid = false;
             }
             // 重建下拉必须在守卫解除后执行，否则会被 _updatingGrid 直接跳过，导致筛选下拉永远只有默认项
+            RebuildTypeFilter();
             RebuildSourceFilter();
             RebuildBatchFilter();
         }
@@ -1356,21 +1670,30 @@ namespace PickLight
             string cur = "";
             var sel = _srcFilter.SelectedItem as ComboBoxItem;
             if (sel != null && sel.Tag != null) cur = sel.Tag.ToString();
-            var srcs = _items.Select(i => i.Source).Where(s => !string.IsNullOrEmpty(s)).Distinct().OrderBy(s => s).ToList();
+            // 条数联动：按当前 类型+批次 筛选结果为统计基准（自身来源条件不参与）
+            var cType = _typeFilter.SelectedItem as ComboBoxItem;
+            var cBatch = _batchFilter.SelectedItem as ComboBoxItem;
+            string ttype = (cType != null && cType.Tag != null) ? cType.Tag.ToString() : "全部类型";
+            string tbatch = (cBatch != null && cBatch.Tag != null) ? cBatch.Tag.ToString() : "全部记录";
+            var baseList = _items.Where(i =>
+                (ttype == "全部类型" || (i.Type ?? "") == ttype) &&
+                (tbatch == "全部记录" || (i.Batch ?? "历史记录") == tbatch)).ToList();
+            var srcs = baseList.Select(i => i.Source).Where(s => !string.IsNullOrEmpty(s)).Distinct().OrderBy(s => s).ToList();
             _srcFilter.SelectionChanged -= SrcFilterChanged;
             _srcFilter.Items.Clear();
-            _srcFilter.Items.Add(MakeBatchItem("全部来源"));
-            foreach (var s in srcs) _srcFilter.Items.Add(MakeBatchItem(s));
+            _srcFilter.Items.Add(MakeCountItem("全部来源", baseList.Count));
+            foreach (var s in srcs) _srcFilter.Items.Add(MakeCountItem(s, baseList.Count(i => (i.Source ?? "") == s)));
             int idx = _srcFilter.Items.Cast<ComboBoxItem>().ToList().FindIndex(c => c.Tag != null && c.Tag.ToString() == cur);
             _srcFilter.SelectedIndex = idx >= 0 ? idx : 0;
             _srcFilter.SelectionChanged += SrcFilterChanged;
         }
 
         // 批次导入日期：该批次内记录 ImportTime 的最大值（覆盖导入自动更新为新时间），格式 yyyy-MM-dd
-        string BatchDate(string b)
+        string BatchDate(string b, IEnumerable<LinkItem> baseList = null)
         {
+            var src = baseList ?? _items;
             string latest = "";
-            foreach (var i in _items)
+            foreach (var i in src)
                 if ((i.Batch ?? "") == b && !string.IsNullOrEmpty(i.ImportTime) && string.CompareOrdinal(i.ImportTime, latest) > 0) latest = i.ImportTime;
             return latest.Length >= 10 ? latest.Substring(0, 10) : "";
         }
@@ -1400,11 +1723,13 @@ namespace PickLight
 
         // 下拉项公共样式：列表项内容为"名称 + 条数 + 导入日期"完整混排（长名自动换行）；
         // 选中框由 ComboBox 模板绑定 SelectedItem.Tag 只显示纯名称（单行省略），互不干扰
-        ComboBoxItem MakeBatchItem(string b)
+        // baseList：联动统计基准（默认全量 _items；筛选联动时传入其他筛选条件下的条目集合）
+        ComboBoxItem MakeBatchItem(string b, IEnumerable<LinkItem> baseList = null)
         {
             var ci = new ComboBoxItem { Tag = b };
-            string dt = BatchDate(b);
-            int cnt = (b == "全部记录") ? _items.Count : _items.Count(i => (i.Batch ?? "历史记录") == b);
+            var src = baseList ?? _items;
+            string dt = BatchDate(b, baseList);
+            int cnt = (b == "全部记录") ? src.Count() : src.Count(i => (i.Batch ?? "历史记录") == b);
             var tb = new TextBlock
             {
                 FontSize = 13.0,
@@ -1422,17 +1747,73 @@ namespace PickLight
             return ci;
         }
 
+        // 类型/来源筛选下拉项："名称 + 条数"（计数按类型/来源现算，不复用批次计数逻辑，避免永远显示 0 条）
+        ComboBoxItem MakeCountItem(string name, int cnt)
+        {
+            var ci = new ComboBoxItem { Tag = name };
+            var tb = new TextBlock
+            {
+                FontSize = 13.0,
+                Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59)),
+                VerticalAlignment = VerticalAlignment.Center,
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 440
+            };
+            tb.Inlines.Add(new Run { Text = name, FontSize = 13.0, Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59)) });
+            tb.Inlines.Add(new Run { Text = "　·　" + cnt + " 条", FontSize = 11, Foreground = (Brush)FindResource("TextSecondary") });
+            ci.Content = tb;
+            return ci;
+        }
+
+        // 类型筛选下拉重建：数据变化（导入/删除/筛选）后现算各类型条数；固定显示 视频/图片/音频 三类（0 条也保留），其后追加其他动态类型。
+        // 条数联动：按当前 来源+批次 筛选结果为统计基准（自身类型条件不参与，避免"全部类型"条数被自己筛掉）
+        void RebuildTypeFilter()
+        {
+            if (_updatingGrid) return;
+            string cur = "";
+            var sel = _typeFilter.SelectedItem as ComboBoxItem;
+            if (sel != null && sel.Tag != null) cur = sel.Tag.ToString();
+            var cSrc = _srcFilter.SelectedItem as ComboBoxItem;
+            var cBatch = _batchFilter.SelectedItem as ComboBoxItem;
+            string tsrc = (cSrc != null && cSrc.Tag != null) ? cSrc.Tag.ToString() : "全部来源";
+            string tbatch = (cBatch != null && cBatch.Tag != null) ? cBatch.Tag.ToString() : "全部记录";
+            var baseList = _items.Where(i =>
+                (tsrc == "全部来源" || (i.Source ?? "") == tsrc) &&
+                (tbatch == "全部记录" || (i.Batch ?? "历史记录") == tbatch)).ToList();
+            var exist = baseList.Select(i => i.Type).Where(t => !string.IsNullOrEmpty(t)).Distinct().ToList();
+            var ordered = new List<string>();
+            foreach (var p in new string[] { "视频", "图片", "音频" })
+                ordered.Add(p); // 固定三类始终显示，0 条也保留，避免下拉选项随数据增减而漂移
+            foreach (var t in exist)
+                if (!ordered.Contains(t)) ordered.Add(t);
+            _typeFilter.SelectionChanged -= TypeFilterChanged;
+            _typeFilter.Items.Clear();
+            _typeFilter.Items.Add(MakeCountItem("全部类型", baseList.Count));
+            foreach (var t in ordered) _typeFilter.Items.Add(MakeCountItem(t, baseList.Count(i => (i.Type ?? "") == t)));
+            int idx = _typeFilter.Items.Cast<ComboBoxItem>().ToList().FindIndex(c => c.Tag != null && c.Tag.ToString() == cur);
+            _typeFilter.SelectedIndex = idx >= 0 ? idx : 0;
+            _typeFilter.SelectionChanged += TypeFilterChanged;
+        }
+
         void RebuildBatchFilter()
         {
             if (_updatingGrid) return;
             string cur = "";
             var sel = _batchFilter.SelectedItem as ComboBoxItem;
             if (sel != null && sel.Tag != null) cur = sel.Tag.ToString();
+            // 条数联动：按当前 类型+来源 筛选结果为统计基准（自身批次条件不参与）
+            var cType = _typeFilter.SelectedItem as ComboBoxItem;
+            var cSrc = _srcFilter.SelectedItem as ComboBoxItem;
+            string ttype = (cType != null && cType.Tag != null) ? cType.Tag.ToString() : "全部类型";
+            string tsrc = (cSrc != null && cSrc.Tag != null) ? cSrc.Tag.ToString() : "全部来源";
+            var baseList = _items.Where(i =>
+                (ttype == "全部类型" || (i.Type ?? "") == ttype) &&
+                (tsrc == "全部来源" || (i.Source ?? "") == tsrc)).ToList();
             var batches = _items.Select(i => i.Batch).Where(b => !string.IsNullOrEmpty(b)).Distinct().OrderBy(b => b).ToList();
             _batchFilter.SelectionChanged -= BatchFilterChanged;
             _batchFilter.Items.Clear();
-            _batchFilter.Items.Add(MakeBatchItem("全部记录"));
-            foreach (var b in batches) _batchFilter.Items.Add(MakeBatchItem(b));
+            _batchFilter.Items.Add(MakeBatchItem("全部记录", baseList));
+            foreach (var b in batches) _batchFilter.Items.Add(MakeBatchItem(b, baseList));
             int idx = cur.Length > 0 ? _batchFilter.Items.Cast<ComboBoxItem>().ToList().FindIndex(c => (c.Tag != null && c.Tag.ToString() == cur)) : 0;
             _batchFilter.SelectedIndex = idx >= 0 ? idx : 0;
             _batchFilter.SelectionChanged += BatchFilterChanged;
@@ -1444,8 +1825,17 @@ namespace PickLight
             foreach (var b in _items.Select(i => i.Batch).Where(x => !string.IsNullOrEmpty(x)).Distinct().OrderBy(x => x))
             {
                 int cnt = _items.Count(i => (i.Batch ?? "历史记录") == b);
+                // 来源文件可能多个（| 分隔），统计去重后的文件数
+                var srcSet = new List<string>();
+                foreach (var i in _items)
+                {
+                    if ((i.Batch ?? "历史记录") != b || string.IsNullOrEmpty(i.SourceFile)) continue;
+                    foreach (var p in i.SourceFile.Split('|'))
+                        if (p.Length > 0 && !srcSet.Contains(p)) srcSet.Add(p);
+                }
+                int srcCnt = srcSet.Count;
                 string dt = BatchDate(b);
-                string txt = b + "　·　" + cnt + " 条" + (dt.Length > 0 ? "　·　导入于 " + dt : "");
+                string txt = b + "　·　" + cnt + " 条" + (srcCnt > 0 ? "　·　来源 " + srcCnt + " 个文件" : "") + (dt.Length > 0 ? "　·　导入于 " + dt : "");
                 // 长批次名在弹窗列表内换行显示完整，不横向撑破窗口
                 list.Items.Add(new ListBoxItem
                 {
@@ -1453,6 +1843,74 @@ namespace PickLight
                     Tag = b
                 });
             }
+        }
+
+        // 收集某分组登记的来源文件（SourceFile 支持多文件，用 | 分隔）
+        List<string> BatchSources(string batch)
+        {
+            var files = new List<string>();
+            foreach (var it in _items)
+            {
+                if ((it.Batch ?? "历史记录") != batch || string.IsNullOrEmpty(it.SourceFile)) continue;
+                foreach (var p in it.SourceFile.Split('|'))
+                    if (p.Length > 0 && !files.Contains(p)) files.Add(p);
+            }
+            return files;
+        }
+
+        // 重新获取：按分组回读它的来源文件，把文件里最新出现的链接并入同一分组（已存在的链接自动跳过）
+        // 返回给调用方的提示文本（空字符串 = 用户取消，不需要提示）；列表刷新由调用方负责
+        string RefreshBatch(string batch)
+        {
+            var files = BatchSources(batch);
+            // 旧版本导入的记录没有来源文件：就地让用户选文件并登记，选完立刻回读，不必绕回主界面重新导入
+            if (files.Count == 0)
+            {
+                bool pick = ShowDialogNotice("没有登记来源文件",
+                    "分组「" + batch + "」里的记录还没有来源文件（旧版本导入时没有保存这个信息）。\n\n"
+                    + "选择该分组的缓存文件后，这些文件会登记为本组来源，并立即回读其中的最新链接。",
+                    false, "选择文件…", true);
+                if (!pick) return "";
+                var fd = new System.Windows.Forms.OpenFileDialog();
+                fd.Multiselect = true;
+                fd.Title = "选择该分组的缓存文件";
+                fd.CheckFileExists = false; // 缓存文件常被游戏独占，别让系统"正在使用"提示挡住选择
+                fd.ValidateNames = false;
+                fd.DereferenceLinks = false;
+                fd.RestoreDirectory = true;
+                if (fd.ShowDialog() != System.Windows.Forms.DialogResult.OK) return "";
+                string joined = string.Join("|", fd.FileNames);
+                foreach (var it in _items)
+                    if ((it.Batch ?? "历史记录") == batch && string.IsNullOrEmpty(it.SourceFile)) it.SourceFile = joined;
+                SaveHistory();
+                files = BatchSources(batch);
+                if (files.Count == 0) return "";
+            }
+            int missing = 0;
+            _newCount = 0; _dupCount = 0; _lockedCount = 0; _srcTaggedCount = 0;
+            var pending = new List<LinkItem>();
+            foreach (var f in files)
+            {
+                if (!File.Exists(f)) { missing++; continue; }
+                ScanFile(f, pending);
+            }
+            string importNow = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            int added = 0;
+            foreach (var it in pending)
+            {
+                if (it.Url.Length == 0) continue;
+                it.Batch = batch;
+                it.ImportTime = importNow;
+                _items.Add(it);
+                added++;
+            }
+            SaveHistory(); UpdateCount(); ApplyFilter(); RebuildBatchFilter();
+            _rbFiles = files.Count; _rbAdded = added; _rbSkipped = _dupCount; _rbMissing = missing; _rbLocked = _lockedCount;
+            string msg = "已重新获取「" + batch + "」：回读来源文件 " + files.Count + " 个，新增 " + added + " 条，已存在跳过 " + _dupCount + " 条。";
+            if (missing > 0) msg += "\n" + missing + " 个来源文件已不存在（被移动或删除）。";
+            if (_lockedCount > 0) msg += "\n" + _lockedCount + " 个文件正被其他程序独占（游戏/启动器在运行），无法读取——请关闭后重试。";
+            SetStatus(msg.Replace("\n", " "));
+            return msg;
         }
 
         void ManageBatches()
@@ -1471,9 +1929,10 @@ namespace PickLight
             };
             dlg.PreviewKeyDown += (s2, e2) => { if (e2.Key == Key.Escape) dlg.Close(); }; // ESC 关闭管理窗口
             var root = new StackPanel { Margin = new Thickness(16) };
+            new InputFocusGuard(dlg, root).Attach(); // 重命名输入框与主窗口同一套规则：点列表/空白即失焦
             var tip = new TextBlock
             {
-                Text = "这里管理的是记录的导入分组。选中分组后可重命名或删除。删除将移除该分组全部记录，不可恢复。",
+                Text = "这里管理的是记录的导入分组。选中分组后可重命名、重新获取或删除。重新获取会回读该分组的来源缓存文件，把其中最新的链接并入该分组（已存在的链接自动跳过）。删除将移除该分组全部记录，不可恢复。",
                 Foreground = (Brush)FindResource("TextSecondary"),
                 TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(0, 0, 0, 10)
@@ -1505,9 +1964,12 @@ namespace PickLight
             var btnRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
             var btnRename = MakeBtn("重命名", PrimaryButtonStyle(13.0), 96, 38); // 主操作：主题色
             var btnDelete = MakeBtn("删除分组", DangerButtonStyle(13.0), 96, 38); // 危险操作：红色
+            var btnRefresh = MakeBtn("重新获取", (Style)FindResource("ToolButton"), 96, 38); // 回读来源文件，并入同分组
+            btnRefresh.ToolTip = "回读该分组的来源缓存文件，把文件中最新的链接并入该分组（已存在的链接自动跳过）";
             var btnClose = MakeBtn("关闭", (Style)FindResource("ToolButton"), 96, 38); // 次操作：白底
             btnRename.IsEnabled = false; // 初始未选中任何分组：重命名/删除禁用
             btnDelete.IsEnabled = false;
+            btnRefresh.IsEnabled = false;
             // 选中批次后自动把旧名填入输入框，直接改即可重命名，交互更明确
             // 未选中任何分组时，"重命名/删除分组"禁用（灰化），限制无效操作
             list.SelectionChanged += (s, e) =>
@@ -1517,9 +1979,35 @@ namespace PickLight
                 renameBox.Text = hasSel ? sel.Tag.ToString() : "";
                 btnRename.IsEnabled = hasSel;
                 btnDelete.IsEnabled = hasSel;
+                btnRefresh.IsEnabled = hasSel;
             };
             btnRename.Margin = new Thickness(0, 0, 8, 0);
             btnDelete.Margin = new Thickness(0, 0, 8, 0);
+            btnRefresh.Margin = new Thickness(0, 0, 8, 0);
+            // 重新获取：回读该分组的来源文件（米哈游缓存这类文件会持续追加内容，重新读能拿到新链接）
+            btnRefresh.Click += (s, e) =>
+            {
+                var sel = list.SelectedItem as ListBoxItem;
+                if (sel == null || sel.Tag == null) return;
+                string name = sel.Tag as string;
+                this.Activate();
+                string msg = RefreshBatch(name);
+                RefreshBatchList(list);
+                foreach (ListBoxItem li in list.Items)
+                    if ((li.Tag as string) == name) { list.SelectedItem = li; break; }
+                this.Activate();
+                if (msg.Length > 0)
+                {
+                    string note = "";
+                    if (_rbMissing > 0) note += _rbMissing + " 个来源文件已不存在（被移动或删除）。";
+                    if (_rbLocked > 0) note += (note.Length > 0 ? "\n" : "") + _rbLocked + " 个文件正被其他程序独占（游戏/启动器在运行），请关闭后重试。";
+                    ShowStatsNotice("重新获取完成", name,
+                        new string[] { "回读来源文件", "新增链接", "跳过重复" },
+                        new int[] { _rbFiles, _rbAdded, _rbSkipped },
+                        new string[] { "个", "条", "条" },
+                        note, _rbLocked > 0 || _rbMissing > 0);
+                }
+            };
             btnRename.Click += (s, e) =>
             {
                 var sel = list.SelectedItem as ListBoxItem;
@@ -1532,8 +2020,7 @@ namespace PickLight
                 bool nameExists = _items.Any(i => (i.Batch ?? "历史记录") != oldName && (i.Batch ?? "历史记录") == newName);
                 if (nameExists)
                 {
-                    if (System.Windows.MessageBox.Show(this, "已存在同名分组「" + newName + "」，重命名后将与其合并，是否继续？", "拾光",
-                        MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+                    if (!ShowConfirm("重命名并合并", "已存在同名分组「" + newName + "」，重命名后将与其合并，是否继续？", "合并", false)) return;
                 }
                 int n = 0;
                 foreach (var it in _items)
@@ -1555,8 +2042,7 @@ namespace PickLight
                 var sel = list.SelectedItem as ListBoxItem;
                 if (sel == null) return;
                 string name = sel.Tag as string;
-                if (System.Windows.MessageBox.Show(this, "确定删除该分组「" + name + "」及其全部记录？此操作不可恢复。", "拾光",
-                    MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+                if (!ShowConfirm("删除分组", "确定删除该分组「" + name + "」及其全部记录？此操作不可恢复。", "删除", true)) return;
                 var doomed = _items.Where(i => (i.Batch ?? "历史记录") == name).ToList();
                 foreach (var it in doomed) if (!string.IsNullOrEmpty(it.Url)) _seen.Remove(it.Url);
                 foreach (var it in doomed) _items.Remove(it);
@@ -1567,7 +2053,7 @@ namespace PickLight
                 SetStatus("已删除分组「" + name + "」，移除 " + doomed.Count + " 条记录。");
             };
             btnClose.Click += (s, e) => dlg.Close();
-            btnRow.Children.Add(btnRename); btnRow.Children.Add(btnDelete); btnRow.Children.Add(btnClose);
+            btnRow.Children.Add(btnRename); btnRow.Children.Add(btnRefresh); btnRow.Children.Add(btnDelete); btnRow.Children.Add(btnClose);
             root.Children.Add(tip);
             root.Children.Add(list);
             root.Children.Add(renameLabel);
@@ -1593,7 +2079,8 @@ namespace PickLight
                 try { _previewWindow.Close(); } catch { }
                 _previewWindow = null;
             }
-            // 构建当前可见的、有地址的项导航列表（与筛选保持一致：类型+来源+批次+关键词）
+            // 构建当前可见的、有地址的项导航列表：直接取 DataGrid 当前显示的行（_grid.Items 含用户排序+筛选后的顺序），
+            // 所见即所翻——同时间戳多条或切换时间排序后，预览序号始终与列表行号一致，不再自行排序
             var selType2 = _typeFilter.SelectedItem as ComboBoxItem;
             var selSrc2 = _srcFilter.SelectedItem as ComboBoxItem;
             string ftype = (selType2 != null && selType2.Tag != null) ? selType2.Tag.ToString() : "全部类型";
@@ -1601,22 +2088,26 @@ namespace PickLight
             var selBatch2 = _batchFilter.SelectedItem as ComboBoxItem;
             string fbatch = (selBatch2 != null && selBatch2.Tag != null) ? selBatch2.Tag.ToString() : "全部记录";
             string fkw = (_search.Text ?? "").Trim().ToLowerInvariant();
-            var items = _items.Where(x =>
-                !string.IsNullOrEmpty(x.Url) &&
-                (ftype == "全部类型" || x.Type == ftype) &&
-                (fsrc == "全部来源" || x.Source == fsrc) &&
-                (fbatch == "全部记录" || (x.Batch ?? "历史记录") == fbatch) &&
-                (fkw.Length == 0 || x.Url.ToLowerInvariant().Contains(fkw) || (x.Time ?? "").Contains(fkw) || (x.Source ?? "").ToLowerInvariant().Contains(fkw) || (x.Note ?? "").ToLowerInvariant().Contains(fkw))
-            ).ToList();
-            // 弹窗上下切换顺序跟随列表当前排序（时间列：默认降序/最新在前，与 DataGrid 显示顺序一致）
-            var srcView = CollectionViewSource.GetDefaultView(_items);
-            if (srcView.SortDescriptions.Count > 0 && srcView.SortDescriptions[0].PropertyName == "Time")
+            // 构建当前可见、有地址的项导航列表：直接用主列表视图（view.Filter=当前筛选、view 排序=列表排序）的顺序，
+            // 与 DataGrid 显示严格一致（所见即所翻），不自行排序，避免同时间戳/切换排序后序号错位
+            Func<List<LinkItem>> buildNavItems = () =>
             {
-                if (srcView.SortDescriptions[0].Direction == ListSortDirection.Descending)
-                    items = items.OrderByDescending(x => x.Time ?? "").ToList();
-                else
-                    items = items.OrderBy(x => x.Time ?? "").ToList();
-            }
+                var v = CollectionViewSource.GetDefaultView(_items);
+                var list = new List<LinkItem>();
+                foreach (var o in v)
+                {
+                    var x = o as LinkItem;
+                    if (x == null) continue;
+                    if (string.IsNullOrEmpty(x.Url)) continue;
+                    if (ftype != "全部类型" && x.Type != ftype) continue;
+                    if (fsrc != "全部来源" && x.Source != fsrc) continue;
+                    if (fbatch != "全部记录" && (x.Batch ?? "历史记录") != fbatch) continue;
+                    if (fkw.Length > 0 && !(x.Url.ToLowerInvariant().Contains(fkw) || (x.Time ?? "").Contains(fkw) || (x.Source ?? "").ToLowerInvariant().Contains(fkw) || (x.Note ?? "").ToLowerInvariant().Contains(fkw))) continue;
+                    list.Add(x);
+                }
+                return list;
+            };
+            var items = buildNavItems();
             int cur = items.FindIndex(x => x == it);
             if (cur < 0) cur = items.Count > 0 ? 0 : -1;
             if (cur < 0 || items.Count == 0) { SetStatus("当前没有可预览的资源。"); return; }
@@ -1643,7 +2134,8 @@ namespace PickLight
                 // 必须裁剪：放大后图片只显示在查看区内，不溢出到弹窗其他区域
                 ClipToBounds = true,
                 Margin = new Thickness(0), // 无内边距：图片查看区贴住卡片容器四边
-                Background = Brushes.Transparent
+                Background = Brushes.Transparent,
+                Focusable = true // 可接收键盘焦点：输入框回车后把焦点移到这里，快捷键立即可用
             };
             var scroller = new ScrollViewer
             {
@@ -1675,7 +2167,8 @@ namespace PickLight
             System.Windows.Point _imgDragLast = new System.Windows.Point();
             Func<double> Cw = () => curPw * _scale;
             Func<double> Ch = () => curPh * _scale;
-            TextBox zoomTxt = null; // 右下角缩放比例输入框（zoomBar 构建后赋值）
+            TextBox zoomTxt = null;         // 右下角比例输入框（真实 TextBox：聚焦时按输入框规则工作）
+            bool zoomEditing = false;       // 比例是否处于输入编辑态（点击进入、回车应用退出、Esc 取消）
             // 完整适配比例：大图缩小到完整可见，小图 1:1（CSS contain 语义）
             Func<double> FitScale = () =>
             {
@@ -1690,7 +2183,7 @@ namespace PickLight
                 _scale = s;
                 imgHost.Width = curPw * s;
                 imgHost.Height = curPh * s;
-                if (zoomTxt != null) zoomTxt.Text = Math.Round(s * 100) + "%";
+                if (zoomTxt != null && !zoomEditing) zoomTxt.Text = Math.Round(s * 100) + "%";
             };
             // 完整适配并居中（打开/切换/复原/窗口变化）
             Action FitAndCenter = () =>
@@ -1753,50 +2246,141 @@ namespace PickLight
                 Margin = new Thickness(10, 0, 0, 10),
                 Cursor = System.Windows.Input.Cursors.Hand,
                 Padding = new Thickness(11, 5, 11, 5),
-                ToolTip = "切换透明图片预览背景：棋盘格 / 深色 / 浅色"
+                MinWidth = 128, // 三种背景名长度不同，固定最小宽度避免切换时按钮宽度跳动
+                ToolTip = "切换透明图片预览背景：棋盘格 / 深色 / 浅色（快捷键 B）"
             };
-            var bgNames = new[] { "背景：棋盘格", "背景：深色", "背景：浅色" };
-            bBg.Click += (s, e) => { bgIdx = (bgIdx + 1) % previewBgs.Count; content.Background = previewBgs[bgIdx]; bBg.Content = bgNames[bgIdx]; };
-            // 右下角缩放控制条：实时比例（可直接输入数值，回车生效）+ 缩小/放大/100%/适配（标准看图软件控制，风格与 bBg 统一）
-            zoomTxt = new TextBox
+            var bgNames = new[] { "背景：棋盘格（B）", "背景：深色（B）", "背景：浅色（B）" };
+            // 统一的背景循环切换（按钮点击 / 键盘 B / 手动命中 三处共用，避免重复代码）
+            Action cycleBg = () =>
             {
-                FontSize = 12,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59)),
+                bgIdx = (bgIdx + 1) % previewBgs.Count;
+                content.Background = previewBgs[bgIdx];
+                bBg.Content = bgNames[bgIdx];
+            };
+            bBg.Content = bgNames[0];
+            bBg.Click += (s, e) => cycleBg();
+            // 右下角缩放控制条：实时比例 + 缩小/放大/复原（标准看图软件控制，风格与 bBg 统一）
+            // 比例数值是真正的 TextBox：聚焦时完全按输入框规则工作（Ctrl+A 全选、方向键移光标、Delete 等都不会被快捷键抢）；
+            // 只有回车提交/ Esc 取消两个动作由程序接管，退出后键盘焦点真正还给窗口，快捷键恢复
+            var zoomBox = new Border
+            {
+                Width = 54,
                 Background = new SolidColorBrush(Color.FromRgb(255, 255, 255)),
                 BorderBrush = new SolidColorBrush(Color.FromRgb(203, 213, 225)),
                 BorderThickness = new Thickness(1),
-                VerticalContentAlignment = VerticalAlignment.Center,
-                TextAlignment = TextAlignment.Center,
-                Width = 50,
-                Padding = new Thickness(3, 1, 3, 1),
-                ToolTip = "直接输入比例数值，回车生效（如 150 = 150%）"
+                CornerRadius = new CornerRadius(3),
+                Padding = new Thickness(0),
+                VerticalAlignment = VerticalAlignment.Center
             };
-            zoomTxt.KeyDown += (s, e2) =>
+            zoomTxt = new TextBox
             {
-                if (e2.Key == Key.Enter)
+                Text = "100%",
+                FontSize = 12,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59)),
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(2, 1, 2, 1),
+                TextAlignment = TextAlignment.Center,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                HorizontalContentAlignment = HorizontalAlignment.Center,
+                IsReadOnly = true,
+                IsUndoEnabled = false,
+                IsTabStop = false,
+                Height = 22,
+                Cursor = System.Windows.Input.Cursors.IBeam,
+                SelectionBrush = new SolidColorBrush(Color.FromRgb(15, 118, 110)),
+                ToolTip = "点击输入比例数值，回车生效（如 150 = 150%）；Esc 取消"
+            };
+            zoomBox.Child = zoomTxt;
+            // 输入框级再断一次输入法：文本框获得焦点时窗口级开关可能被重置，这里保证纯数字输入、不出候选窗
+            try { System.Windows.Input.InputMethod.SetIsInputMethodEnabled(zoomTxt, false); } catch { }
+            Action<bool> setZoomEditVisual = (on) =>
+            {
+                zoomBox.BorderBrush = new SolidColorBrush(on ? Color.FromRgb(15, 118, 110) : Color.FromRgb(203, 213, 225));
+                if (!on) zoomTxt.Text = Math.Round(_scale * 100) + "%";
+            };
+            // 进入编辑：解除只读、聚焦并全选现有数字（直接输入即覆盖）
+            Action enterZoomEdit = () =>
+            {
+                if (img.Source == null || zoomEditing) return;
+                zoomEditing = true;
+                setZoomEditVisual(true);
+                zoomTxt.Text = Math.Round(_scale * 100).ToString();
+                zoomTxt.IsReadOnly = false;
+                zoomTxt.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try { zoomTxt.Focus(); zoomTxt.SelectAll(); }
+                    catch { }
+                }), System.Windows.Threading.DispatcherPriority.Input);
+            };
+            // 退出编辑：commit=true 应用比例；无论提交还是取消，都把键盘焦点真正交还窗口（回到刚打开弹窗的状态）
+            Action<bool> exitZoomEdit = null;
+            exitZoomEdit = (commit) =>
+            {
+                if (!zoomEditing) return;
+                zoomEditing = false;      // 先撤标志：消息层立即恢复快捷键拦截
+                if (commit)
                 {
                     double v;
-                    if (double.TryParse(zoomTxt.Text.Replace("%", "").Trim(), out v))
+                    if (double.TryParse((zoomTxt.Text ?? "").Replace("%", "").Trim(), out v))
                     {
                         v = Math.Max(5, Math.Min(1000, v));
-                        if (img.Source != null)
-                        {
-                            double ns = v / 100.0;
-                            if (ns <= FitScale() + 0.001) FitAndCenter();
-                            else ZoomAround(ns, scroller.ViewportWidth / 2, scroller.ViewportHeight / 2);
-                        }
+                        if (img.Source != null) ZoomAround(v / 100.0, scroller.ViewportWidth / 2, scroller.ViewportHeight / 2);
                     }
-                    else if (img.Source != null) FitAndCenter();
-                    e2.Handled = true;
+                }
+                zoomTxt.IsReadOnly = true;
+                // 三重失焦：Focusable 抖动强制 WPF 移焦 + 清逻辑焦点 + SetFocus 把物理焦点还给窗口
+                zoomTxt.Focusable = false;
+                Keyboard.ClearFocus();
+                FocusManager.SetFocusedElement(zoomTxt, null);
+                zoomTxt.Focusable = true;
+                try
+                {
+                    IntPtr winHwnd = new WindowInteropHelper(win).Handle;
+                    if (winHwnd != IntPtr.Zero) SetFocus(winHwnd);
+                }
+                catch { }
+                setZoomEditVisual(false);
+            };
+            // 预览弹窗也装同一套输入框焦点规则：点图像/按钮等任意非输入框区域即失焦，
+            // 顺带退出比例编辑态（否则编辑态标志还在，消息层会继续吞掉 R/B/WASD 等快捷键）
+            new InputFocusGuard(win, root, () => exitZoomEdit(false), false).Attach();
+            // 输入内容净化：只保留数字（最多 4 位），避免输入法/粘贴带入其它字符
+            zoomTxt.TextChanged += (s, e2) =>
+            {
+                if (!zoomEditing) return;
+                string digits = "";
+                foreach (char ch in (zoomTxt.Text ?? "")) if (char.IsDigit(ch) && digits.Length < 4) digits += ch;
+                if (digits != (zoomTxt.Text ?? ""))
+                {
+                    zoomTxt.Text = digits;
+                    zoomTxt.CaretIndex = digits.Length;
                 }
             };
-            // 失焦时还原为当前实际比例（未回车提交的输入不生效）
-            zoomTxt.LostFocus += (s, e2) => { if (zoomTxt != null) zoomTxt.Text = Math.Round(_scale * 100) + "%"; };
+            // 粘贴：含非数字则整体拒绝
+            DataObject.AddPastingHandler(zoomTxt, (s, e2) =>
+            {
+                try
+                {
+                    string pasteTxt = (e2.DataObject != null && e2.DataObject.GetDataPresent(typeof(string)))
+                        ? (string)e2.DataObject.GetData(typeof(string)) : "";
+                    for (int i = 0; i < pasteTxt.Length; i++) if (!char.IsDigit(pasteTxt[i])) { e2.CancelCommand(); return; }
+                }
+                catch { e2.CancelCommand(); }
+            });
+            // 鼠标点击进入编辑（由消息层命中判断先行接管，这里兜底）
+            zoomBox.PreviewMouseLeftButtonDown += (s, e2) =>
+            {
+                enterZoomEdit();
+                e2.Handled = true;
+            };
+            // 失焦即按"取消"退出（点其它地方、点按钮都回到非编辑态）
+            zoomTxt.LostKeyboardFocus += (s, e2) => { if (zoomEditing) exitZoomEdit(false); };
             var zoomStyle = BuildActionButtonStyle(Color.FromRgb(255, 255, 255), Color.FromRgb(248, 250, 252), Color.FromRgb(241, 245, 249), Color.FromRgb(226, 232, 240), Color.FromRgb(203, 213, 225), new SolidColorBrush(Color.FromRgb(30, 41, 59)), true, 12);
             var btnZoomOut = new Button { Content = "-", Style = zoomStyle, Cursor = System.Windows.Input.Cursors.Hand, Padding = new Thickness(7, 3, 7, 3), ToolTip = "缩小" };
             var btnZoomIn = new Button { Content = "+", Style = zoomStyle, Cursor = System.Windows.Input.Cursors.Hand, Padding = new Thickness(7, 3, 7, 3), ToolTip = "放大" };
-            var btnZoom100 = new Button { Content = "复原", Style = zoomStyle, Cursor = System.Windows.Input.Cursors.Hand, Padding = new Thickness(7, 3, 7, 3), ToolTip = "回到默认完整展示" };
+            var btnZoom100 = new Button { Content = "复原（R）", Style = zoomStyle, Cursor = System.Windows.Input.Cursors.Hand, Padding = new Thickness(7, 3, 7, 3), ToolTip = "回到默认完整展示（快捷键 R）" };
             // 步进缩放：围绕视口中心缩放（标准看图软件行为）
             Action<double> zoomStep = (factor) =>
             {
@@ -1809,7 +2393,13 @@ namespace PickLight
             btnZoomOut.Click += (s, e) =>
             {
                 if (img.Source == null) return;
-                if (!_isFit) { zoomStep(1.0 / 1.15); if (_scale <= FitScale() + 0.001) FitAndCenter(); }
+                if (!_isFit)
+                {
+                    double prev = _scale;
+                    zoomStep(1.0 / 1.15);
+                    // 仅"从大于适配缩回适配附近"时吸附；已在适配以下继续缩小不再回弹（与滚轮同一规则）
+                    if (prev > FitScale() + 0.001 && _scale <= FitScale() + 0.001) FitAndCenter();
+                }
             };
             btnZoomIn.Click += (s, e) =>
             {
@@ -1819,15 +2409,20 @@ namespace PickLight
             btnZoom100.Click += (s, e) => zoomFitNow();
             var zoomBar = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(210, 255, 255, 255)),
-                CornerRadius = new CornerRadius(6),
+                Background = Brushes.Transparent, // 无底色：缩放条只由按钮组成（每个按钮自带渐变底），多个按钮并排
+                BorderThickness = new Thickness(0),
                 Padding = new Thickness(3, 2, 3, 2),
                 HorizontalAlignment = HorizontalAlignment.Right,
                 VerticalAlignment = VerticalAlignment.Bottom,
-                Margin = new Thickness(0, 0, 8, 8)
+                Margin = new Thickness(0, 0, 10, 10)
             };
             var zoomPanel = new StackPanel { Orientation = Orientation.Horizontal };
-            zoomPanel.Children.Add(btnZoomOut); zoomPanel.Children.Add(zoomTxt); zoomPanel.Children.Add(btnZoomIn);
+            btnZoomOut.Margin = new Thickness(0, 0, 3, 0);
+            zoomPanel.Children.Add(btnZoomOut);
+            zoomBox.Margin = new Thickness(0, 0, 3, 0);
+            zoomPanel.Children.Add(zoomBox);
+            btnZoomIn.Margin = new Thickness(0, 0, 3, 0);
+            zoomPanel.Children.Add(btnZoomIn);
             zoomPanel.Children.Add(btnZoom100);
             zoomBar.Child = zoomPanel;
             content.Children.Add(hint);
@@ -1888,8 +2483,8 @@ namespace PickLight
             var stNeutral = BuildActionButtonStyle(Color.FromRgb(255, 255, 255), Color.FromRgb(248, 250, 252), Color.FromRgb(241, 245, 249), Color.FromRgb(226, 232, 240), Color.FromRgb(203, 213, 225), new SolidColorBrush(Color.FromRgb(30, 41, 59)), true, 14);
             var stCopyBig = BuildActionButtonStyle(Color.FromRgb(255, 255, 255), Color.FromRgb(248, 250, 252), Color.FromRgb(241, 245, 249), Color.FromRgb(226, 232, 240), Color.FromRgb(203, 213, 225), new SolidColorBrush(Color.FromRgb(30, 41, 59)), true, 14);
             var stDlBig = BuildActionButtonStyle(Color.FromRgb(34, 197, 94), Color.FromRgb(22, 163, 74), Color.FromRgb(22, 163, 74), Color.FromRgb(21, 128, 61), Color.FromRgb(21, 128, 61), Brushes.White, false, 14);
-            var bPrev = new Button { Content = "◀ 上一个", Style = stNeutral, Margin = new Thickness(4, 2, 4, 2) };
-            var bNext = new Button { Content = "▶ 下一个", Style = stNeutral, Margin = new Thickness(4, 2, 4, 2) };
+            var bPrev = new Button { Content = "上一张（← ↑ A W）", Style = stNeutral, Margin = new Thickness(4, 2, 4, 2), MinWidth = 136, ToolTip = "上一张（← / ↑ / A / W）" };
+            var bNext = new Button { Content = "下一张（→ ↓ D S）", Style = stNeutral, Margin = new Thickness(4, 2, 4, 2), MinWidth = 136, ToolTip = "下一张（→ / ↓ / D / S）" };
             var bOpen = new Button { Content = "浏览器打开", Style = stNeutral, Margin = new Thickness(4, 2, 4, 2) };
             var bCopy = new Button { Content = "复制地址", Style = stCopyBig, Margin = new Thickness(4, 2, 4, 2) };
             var bDl = new Button { Content = "下载", Style = stDlBig, Margin = new Thickness(4, 2, 4, 2) };
@@ -1910,8 +2505,27 @@ namespace PickLight
 
             win.Content = root;
 
-            // ESC 关闭预览弹窗（图片查看器标准交互）
-            win.PreviewKeyDown += (s2, e2) => { if (e2.Key == Key.Escape) win.Close(); };
+            // 输入框内的提交/取消：回车应用、Esc 取消（都只退出输入，不关闭弹窗）；
+            // 非编辑态 Esc 仍是关闭预览弹窗（图片查看器标准交互）
+            win.PreviewKeyDown += (s2, e2) =>
+            {
+                if (e2.Key == Key.Escape)
+                {
+                    if (zoomEditing)
+                    {
+                        exitZoomEdit(false);
+                        e2.Handled = true;
+                        return;
+                    }
+                    win.Close();
+                    return;
+                }
+                if (e2.Key == Key.Enter && zoomEditing)
+                {
+                    exitZoomEdit(true);
+                    e2.Handled = true;
+                }
+            };
 
 
             int nav = cur;
@@ -2021,16 +2635,27 @@ namespace PickLight
                 if (img.Source == null) return;
                 if (_isFit) FitAndCenter();
             };
-            // 滚轮缩放：围绕鼠标指针位置（标准看图软件交互）；适配状态下向下滚不缩小
+            // 滚轮缩放：围绕鼠标指针位置（标准看图软件交互）；适配状态向下滚也允许继续缩小（小图可缩小观察）
             svImg.PreviewMouseWheel += (s2, e2) =>
             {
                 if (img.Source == null) return;
-                if (_isFit && e2.Delta <= 0) { e2.Handled = true; return; }
-                double s0 = _scale;
-                double s1 = Math.Max(0.05, Math.Min(10.0, s0 * (e2.Delta > 0 ? 1.15 : 1.0 / 1.15)));
                 var mp = e2.GetPosition(scroller);
+                if (_isFit && e2.Delta <= 0)
+                {
+                    // 适配状态向下滚：从适配比例继续缩小（不拦截，解决"缩小无效"）
+                    double ns = Math.Max(0.05, FitScale() / 1.15);
+                    ApplyScale(ns);
+                    _isFit = false;
+                    scroller.ScrollToHorizontalOffset(Math.Max(0, (imgHost.Width - scroller.ViewportWidth) / 2));
+                    scroller.ScrollToVerticalOffset(Math.Max(0, (imgHost.Height - scroller.ViewportHeight) / 2));
+                    e2.Handled = true;
+                    return;
+                }
+                double prev = _scale;
+                double s1 = Math.Max(0.05, Math.Min(10.0, prev * (e2.Delta > 0 ? 1.15 : 1.0 / 1.15)));
                 ZoomAround(s1, mp.X, mp.Y);
-                if (_scale <= FitScale() + 0.001) FitAndCenter(); // 缩小回完整适配
+                // 仅"从大于适配缩小到适配附近"时吸附回完整适配；已在适配以下继续缩小不再回弹（修 100%→87%→100% 循环 bug）
+                if (!_isFit && prev > FitScale() + 0.001 && _scale <= FitScale() + 0.001) FitAndCenter();
                 e2.Handled = true;
             };
             // 双击：还原为"适配容器"比例（不干扰拖动）；单击拖动仅当图片放大超出查看区时才启用平移。
@@ -2041,9 +2666,67 @@ namespace PickLight
             DateTime _lastDownTime = DateTime.MinValue;
             System.Windows.Point _lastDownPos = new System.Windows.Point();
             bool _lbtn = false;
+            Action render = null; // 提前声明：srcHook（键盘消息层）需要引用它
             HwndSourceHook srcHook = (IntPtr h, int msg, IntPtr wParam, IntPtr lParam, ref bool handled) =>
             {
-                const int WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_MOUSEMOVE = 0x0200;
+                const int WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_MOUSEMOVE = 0x0200, WM_KEYDOWN = 0x0100;
+                // 键盘快捷键在消息层拦截：不依赖 WPF 焦点（退出输入后即使 WPF 焦点有残留也能立即恢复）
+                if (msg == WM_KEYDOWN)
+                {
+                    int vk = wParam.ToInt32();
+                    bool isRepeat = (((long)lParam >> 30) & 1) == 1; // bit30 = 之前已按下（连发）
+                    // 编辑态兜底：弹窗已失去激活（例如点了主窗口列表）或当前是加载失败的链接时，
+                    // 输入态必须自动结束，否则 zoomEditing 卡住会把之后所有快捷键挡掉
+                    if (zoomEditing && (!win.IsActive || img.Source == null)) exitZoomEdit(false);
+                    // 比例输入处于编辑态：程序只接管回车/Esc 两个提交动作；
+                    // 其余按键（数字、退格/Delete、左右方向、Home/End、Ctrl+A 全选、Ctrl+C/V/X 等）一律不拦，交给 TextBox 原生处理
+                    if (zoomEditing)
+                    {
+                        if (vk == 0x0D) { handled = true; exitZoomEdit(true); return IntPtr.Zero; }   // 回车：应用并退出
+                        if (vk == 0x1B) { handled = true; exitZoomEdit(false); return IntPtr.Zero; }  // Esc：取消并退出
+                        return IntPtr.Zero;
+                    }
+                    // 非编辑态 Esc：直接关闭预览弹窗。放在消息层而不是只靠 WPF PreviewKeyDown，
+                    // 因为退出输入后键盘焦点已交还窗口、WPF 路由可能拿不到这个键
+                    if (vk == 0x1B)
+                    {
+                        handled = true;
+                        if (!isRepeat) win.Dispatcher.BeginInvoke(new Action(() => { try { win.Close(); } catch { } }), System.Windows.Threading.DispatcherPriority.Input);
+                        return IntPtr.Zero;
+                    }
+                    bool isFit = vk == 0x52;                        // R
+                    bool isBg = vk == 0x42;                         // B
+                    bool isPrev = vk == 0x25 || vk == 0x26 || vk == 0x41 || vk == 0x57; // ← ↑ A W
+                    bool isNext = vk == 0x27 || vk == 0x28 || vk == 0x44 || vk == 0x53; // → ↓ D S
+                    if (isFit || isBg || isPrev || isNext)
+                    {
+                        handled = true; // 吞掉：输入框内也不再收到（避免光标移动/字母输入）
+                        if (!isRepeat)
+                        {
+                            win.Dispatcher.BeginInvoke(new Action(() =>
+                            {
+                                try
+                                {
+                                    // 导航与背景切换不依赖图片是否加载成功：加载失败的链接也必须能上下翻，
+                                    // 只有"复原/适配"需要真实图片尺寸
+                                    if (isFit)
+                                    {
+                                        if (img.Source != null) FitAndCenter();
+                                    }
+                                    else if (isBg) cycleBg();
+                                    else
+                                    {
+                                        if (items.Count == 0) return;
+                                        nav = isPrev ? (nav - 1 + items.Count) % items.Count : (nav + 1) % items.Count;
+                                        render();
+                                    }
+                                }
+                                catch { }
+                            }), System.Windows.Threading.DispatcherPriority.Input);
+                        }
+                        return IntPtr.Zero;
+                    }
+                }
                 if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEMOVE)
                 {
                     int cx = (short)(lParam.ToInt32() & 0xFFFF);
@@ -2061,6 +2744,17 @@ namespace PickLight
                     };
                     if (msg == WM_LBUTTONDOWN)
                     {
+                        // 点击比例框外任何区域：若正在编辑比例则退出并还原显示（未回车不生效）
+                        bool hitZoomBox = false;
+                        if (zoomBox.Visibility == Visibility.Visible && zoomBox.ActualWidth > 1)
+                        {
+                            var zt = zoomBox.PointToScreen(new System.Windows.Point(0, 0));
+                            hitZoomBox = wpt.X >= zt.X && wpt.Y >= zt.Y && wpt.X <= zt.X + zoomBox.ActualWidth && wpt.Y <= zt.Y + zoomBox.ActualHeight;
+                        }
+                        if (!hitZoomBox && zoomEditing)
+                        {
+                            exitZoomEdit(false);
+                        }
                         _lbtn = true;
                         // 手动命中 bBg（左下）与 zoomBar（右下）：不依赖 PointToScreen / WPF Button Click（本环境 svImg 内按钮命中不可靠）
                         double bbW = Math.Max(bBg.ActualWidth, 1), bbH = Math.Max(bBg.ActualHeight, 1);
@@ -2069,7 +2763,7 @@ namespace PickLight
                         double zbLeft = Math.Max(svImg.ActualWidth - zbW - 8, 0), zbTop = Math.Max(svImg.ActualHeight - zbH - 8, 0);
                         if (rel.X >= 10 && rel.X <= 10 + bbW && rel.Y >= bbTop && rel.Y <= bbTop + bbH)
                         {
-                            bgIdx = (bgIdx + 1) % previewBgs.Count; content.Background = previewBgs[bgIdx]; bBg.Content = bgNames[bgIdx];
+                            cycleBg();
                             handled = true; return IntPtr.Zero;
                         }
                         if (rel.X >= zbLeft && rel.X <= zbLeft + zbW && rel.Y >= zbTop && rel.Y <= zbTop + zbH)
@@ -2087,7 +2781,7 @@ namespace PickLight
                                     if (fe == btnZoomOut && img.Source != null) zoomStep(1.0 / 1.15);
                                     else if (fe == btnZoomIn && img.Source != null) zoomStep(1.15);
                                     else if (fe == btnZoom100 && img.Source != null) zoomFitNow();
-                                    else if (fe == zoomTxt) { zoomTxt.Focus(); zoomTxt.SelectAll(); }
+                                    else if (fe == zoomBox && img.Source != null) { enterZoomEdit(); }
                                     handled = true; return IntPtr.Zero;
                                 }
                                 acc += cw;
@@ -2146,6 +2840,10 @@ namespace PickLight
                 IntPtr hwnd = new WindowInteropHelper(win).Handle;
                 if (hwnd != IntPtr.Zero)
                 {
+                    // 弹窗整体断开输入法上下文：字母键快捷键（W/A/S/D/R）不触发输入法候选/不被吞
+                    try { ImmAssociateContext(hwnd, IntPtr.Zero); } catch { }
+                    // WPF 层再禁用一次输入法服务（Text 控件获得焦点会重新启用 IME，双重保险）
+                    try { System.Windows.Input.InputMethod.SetIsInputMethodEnabled(win, false); } catch { }
                     var hsrc = HwndSource.FromHwnd(hwnd);
                     if (hsrc != null) hsrc.AddHook(srcHook);
                 }
@@ -2153,9 +2851,11 @@ namespace PickLight
             win.Loaded += (s2, e2) => installHook();
             win.ContentRendered += (s2, e2) => installHook();
 
-            Action render = null;
             render = () =>
             {
+                // 切图（含切到加载失败的链接）时强制结束比例输入态：输入框内容属于上一张图，
+                // 留着会让编辑态卡死、把之后所有快捷键挡掉
+                if (zoomEditing) exitZoomEdit(false);
                 // 清理上一次内嵌播放的媒体
                 if (_currentMedia != null)
                 {
@@ -2351,7 +3051,7 @@ namespace PickLight
                                                 bmp.StreamSource = ms;
                                                 bmp.EndInit();
                                                 bmp.Freeze();
-                                                img.Source = bmp; img.ToolTip = url; hint.Visibility = Visibility.Collapsed;
+                                                img.Source = bmp; hint.Visibility = Visibility.Collapsed;
                                                 fitImage(bmp);
                                                 // 动画图退回首帧：无静态完整画面，详情行隐藏
                                             }
@@ -2372,7 +3072,7 @@ namespace PickLight
                                         {
                                             if (curNav == nav)
                                             {
-                                                img.Source = bmp; img.ToolTip = url; hint.Visibility = Visibility.Collapsed; fitImage(bmp);
+                                                img.Source = bmp; hint.Visibility = Visibility.Collapsed; fitImage(bmp);
                                                 // 图片详情（链接下方独立卡片）：每项一行"标签 值"；分辨率·格式·大小固定，色彩/DPI/EXIF 有数据才显示
                                                 var pairs = new List<KeyValuePair<string, string>>();
                                                 pairs.Add(new KeyValuePair<string, string>("分辨率", bmp.PixelWidth + " × " + bmp.PixelHeight));
@@ -2473,11 +3173,73 @@ namespace PickLight
 
             bPrev.Click += (s, e) => { nav = (nav - 1 + items.Count) % items.Count; render(); };
             bNext.Click += (s, e) => { nav = (nav + 1) % items.Count; render(); };
+
+            // 键盘翻页：←/↑/A/W 上一张，→/↓/D/S 下一张；R 复原完整视图；B 切换背景（按钮上已标快捷键）
+            win.PreviewKeyDown += (s2, e2) =>
+            {
+                // 比例输入处于编辑态：所有快捷键一律让位，按键完整交还输入框
+                // （Ctrl+A 全选、方向键移动光标、Delete/退格、Ctrl+C/V/X 等编辑操作都不会被抢，
+                //   回车/Esc 由上面的提交处理负责）
+                if (zoomEditing) return;
+                // 输入法先吃掉的字母会以 ImeProcessed 送到这里（此时真正的键在 ImeProcessedKey 里），
+                // 两种都要认，否则"输入法还开着"的机器上 A/W/S/D/R/B 快捷键全都失效
+                Key k = (e2.Key == Key.ImeProcessed) ? e2.ImeProcessedKey : e2.Key;
+                if (k == Key.R)
+                {
+                    if (img.Source != null) FitAndCenter();
+                    e2.Handled = true;
+                    return;
+                }
+                if (k == Key.B)
+                {
+                    cycleBg();
+                    e2.Handled = true;
+                    return;
+                }
+                bool isPrev = k == Key.Left || k == Key.Up || k == Key.A || k == Key.W;
+                bool isNext = k == Key.Right || k == Key.Down || k == Key.D || k == Key.S;
+                if (isPrev || isNext)
+                {
+                    if (e2.IsRepeat) return; // 按住连发只响应一次
+                    if (items.Count == 0) return;
+                    nav = isPrev ? (nav - 1 + items.Count) % items.Count : (nav + 1) % items.Count;
+                    render(); e2.Handled = true;
+                    return;
+                }
+                // 其余按键（数字、退格、回车等）：焦点在输入框时交给输入框正常处理
+                if (e2.OriginalSource is System.Windows.Controls.Primitives.TextBoxBase) return;
+            };
             bOpen.Click += (s, e) => { var c = items[nav]; if (!string.IsNullOrEmpty(c.Url)) { try { System.Diagnostics.Process.Start(c.Url); } catch { SetStatus("无法打开浏览器：" + c.Url); } } };
             bCopy.Click += (s, e) => { var c = items[nav]; if (!string.IsNullOrEmpty(c.Url)) { Clipboard.SetText(c.Url); SetStatus("已复制地址：" + c.Url); } };
             bDl.Click += (s, e) => { DownloadOne(items[nav]); };
 
             _previewWindow = win;
+
+            // 弹窗打开期间跟随主列表变化（切换排序/筛选/导入删除）：重建导航列表并保持当前项，
+            // 序号与列表实时一致（图2/3 场景：预览开着改排序，标题序号不再错位）；仅更新标题，不重载图片
+            {
+                var navView = CollectionViewSource.GetDefaultView(_items);
+                navView.CollectionChanged += (s2, e2) =>
+                {
+                    if (_previewWindow != win) return;
+                    win.Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            var curItem = (nav >= 0 && nav < items.Count) ? items[nav] : null;
+                            var newItems = buildNavItems();
+                            items = newItems;
+                            if (items.Count == 0) { win.Close(); return; }
+                            int ni = curItem != null ? items.FindIndex(x => x == curItem) : -1;
+                            if (ni >= 0) nav = ni;
+                            else if (nav >= items.Count) nav = items.Count - 1;
+                            win.Title = "预览  " + (items[nav].Time ?? "") + "  " + (items[nav].Source ?? "") + "  (" + (nav + 1) + "/" + items.Count + ")";
+                        }
+                        catch { }
+                    }), System.Windows.Threading.DispatcherPriority.Background);
+                };
+            }
+
             render();
             // 弹窗关闭：停止当前播放（ffplay/MediaElement 一并清理，不留残留窗口），并重新激活主窗口
             win.Closed += (s, e) =>
@@ -2525,8 +3287,7 @@ namespace PickLight
             // 批量下载前确认：告知数量与保存位置，避免误触几百条并发下载
             if (all)
             {
-                var r = System.Windows.MessageBox.Show(this, "将下载当前列表共 " + targets.Count + " 个文件到：\n" + _downloadDir + "\n\n是否继续？", "下载全部", MessageBoxButton.YesNo, MessageBoxImage.Question);
-                if (r != MessageBoxResult.Yes) return;
+                if (!ShowConfirm("下载全部", "将下载当前列表共 " + targets.Count + " 个文件到：\n" + _downloadDir + "\n\n是否继续？", "开始下载", false)) return;
             }
             SetStatus((all ? "开始下载当前列表 " : "开始下载选中 ") + targets.Count + " 个文件 → " + _downloadDir);
             int done = 0, fail = 0, total = targets.Count;
@@ -2581,7 +3342,7 @@ namespace PickLight
             {
                 var sb = new StringBuilder();
                 foreach (var r in _items)
-                    sb.AppendLine((r.Time ?? "") + "\t" + r.Type + "\t" + r.Source + "\t" + r.Url + "\t" + (r.Note ?? "") + "\t" + (r.Batch ?? "历史记录") + "\t" + (r.ImportTime ?? ""));
+                    sb.AppendLine((r.Time ?? "") + "\t" + r.Type + "\t" + r.Source + "\t" + r.Url + "\t" + (r.Note ?? "") + "\t" + (r.Batch ?? "历史记录") + "\t" + (r.ImportTime ?? "") + "\t" + (r.SourceFile ?? ""));
                 File.WriteAllText(_historyPath, sb.ToString(), new UTF8Encoding(false));
             }
             catch { }
@@ -2619,6 +3380,7 @@ namespace PickLight
                     it.Time = p[0]; it.Type = p[1]; it.Source = p[2]; it.Url = p[3]; it.Note = p.Length > 4 ? p[4] : "";
                     it.Batch = p.Length > 5 ? p[5] : "历史记录"; // 旧格式（5列）自动归入"历史记录"批次
                     it.ImportTime = p.Length > 6 ? p[6] : ""; // 旧格式无导入时间
+                    it.SourceFile = p.Length > 7 ? p[7] : ""; // 旧格式无来源文件（重新获取时提示无法回读）
                     if (it.Url.Length == 0) continue; // 只记录有效记录：无地址的辅助行（响应头记录等）不进入列表
                     if (!_seen.Add(it.Url)) continue;
                     _items.Add(it);
@@ -2690,7 +3452,7 @@ namespace PickLight
                     if (!fetched)
                     {
                         if (manual)
-                            System.Windows.MessageBox.Show(this, "检查更新失败：" + errMsg, "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                            ShowNotice("检查更新失败", "检查更新失败：" + errMsg, true);
                         return;
                     }
                     Version curV = null, newV = null;
@@ -2699,13 +3461,13 @@ namespace PickLight
                     bool hasNew = curV != null && newV != null && newV > curV;
                     if (!hasNew)
                     {
-                        if (manual) System.Windows.MessageBox.Show(this, "当前已是最新版本 v" + AppVersion + "。", "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                        if (manual) ShowNotice("检查更新", "当前已是最新版本 v" + AppVersion + "。", false);
                         else SetStatus("已是最新版本 v" + AppVersion + "。");
                         return;
                     }
                     if (url.Length == 0)
                     {
-                        System.Windows.MessageBox.Show(this, "发现新版本 v" + tag + "，但该 Release 未附带 .exe 安装包，请到 GitHub Releases 页面手动下载。", "发现新版本", MessageBoxButton.OK, MessageBoxImage.Information);
+                        ShowNotice("发现新版本", "发现新版本 v" + tag + "，但该 Release 未附带 .exe 安装包，请到 GitHub Releases 页面手动下载。", true);
                         return;
                     }
                     ShowUpdateDialog(tag, desc, url);
@@ -2967,9 +3729,8 @@ namespace PickLight
                     string sz = size >= 1048576 ? (size / 1048576.0).ToString("0.0") + " MB" : (size / 1024.0).ToString("0") + " KB";
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
-                        var r = System.Windows.MessageBox.Show(this, "更新包已下载（" + sz + "），重启应用后生效。\n是否立即重启完成更新？", "拾光",
-                            MessageBoxButton.YesNo, MessageBoxImage.Question);
-                        if (r == MessageBoxResult.Yes) RestartForUpdate(newExe);
+                        if (ShowConfirm("更新完成", "更新包已下载（" + sz + "），重启应用后生效。\n是否立即重启完成更新？", "立即重启", false))
+                            RestartForUpdate(newExe);
                         else SetStatus("更新包已下载（" + sz + "），可稍后重启完成更新。");
                     }));
                 }
@@ -2977,7 +3738,7 @@ namespace PickLight
                 {
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
-                        System.Windows.MessageBox.Show(this, "下载更新包失败：" + ex.Message, "拾光", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        ShowNotice("下载更新包失败", "下载更新包失败：" + ex.Message, true);
                         SetStatus("更新下载失败。");
                     }));
                 }
@@ -3006,10 +3767,314 @@ namespace PickLight
             }
             catch (Exception ex)
             {
-                System.Windows.MessageBox.Show(this, "启动更新失败：" + ex.Message + "\n可手动将新 exe 覆盖后重启。", "拾光", MessageBoxButton.OK, MessageBoxImage.Warning);
+                ShowNotice("启动更新失败", "启动更新失败：" + ex.Message + "\n可手动将新 exe 覆盖后重启。", true);
             }
         }
         #endregion
+    }
+
+    // 输入框焦点治理：所有带输入框的窗口（主窗口 / 选择导入记录 / 管理记录 / 预览）共用这一套规则，
+    // 不再每个窗口各写一份，避免"主界面正常、弹窗里点空白后还在打字"这类不一致
+    // 1) 文本框获焦 → 恢复本窗口的输入法；文本框失焦 → 断开本窗口输入法（候选窗不再吞快捷键）
+    // 2) 点击输入框以外的区域 → 取消未上屏的拼音组合、清掉 WPF 焦点、焦点收容到窗口根容器，
+    //    边框高亮与光标一起消失；之后再按键不会落回原输入框
+    // 3) 点在按钮上时不延迟复查：按钮可能刚把焦点交还给输入框（如搜索框自带的"清空"），不能又清掉
+    class InputFocusGuard
+    {
+        readonly Window _win;
+        readonly FrameworkElement _host;   // 焦点收容控件（点空白后焦点落这里）
+        readonly Action _afterDrop;        // 失焦后额外动作（如预览窗口顺带退出比例编辑）
+        readonly bool _textImeAllowed;     // 输入框里是否允许中文输入法（预览的比例框是纯数字，传 false）
+        IntPtr _savedHimc = IntPtr.Zero;
+        bool _imeDetached = false;
+        KeyboardShield _shield;
+
+
+        // 本类自带一份 imm32 声明（各窗口共享同一套输入法切换逻辑）
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern IntPtr ImmAssociateContext(IntPtr hWnd, IntPtr hIMC);
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern IntPtr ImmGetContext(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
+        [System.Runtime.InteropServices.DllImport("imm32.dll")]
+        static extern bool ImmNotifyIME(IntPtr hIMC, int action, int index, int value);
+
+        public InputFocusGuard(Window win, FrameworkElement host) : this(win, host, null, true) { }
+
+        public InputFocusGuard(Window win, FrameworkElement host, Action afterDrop) : this(win, host, afterDrop, true) { }
+
+        public InputFocusGuard(Window win, FrameworkElement host, Action afterDrop, bool textImeAllowed)
+        {
+            _win = win;
+            _host = host;
+            _afterDrop = afterDrop;
+            _textImeAllowed = textImeAllowed;
+        }
+
+        public bool IsTextFocused()
+        {
+            return Keyboard.FocusedElement is System.Windows.Controls.Primitives.TextBoxBase;
+        }
+
+        public void Attach()
+        {
+            // 消息层拦一层（对 IMM 型输入法有效，TSF 型靠下面的元素级开关）
+            _win.SourceInitialized += (s, e) =>
+            {
+                try
+                {
+                    HwndSource src = HwndSource.FromHwnd(new WindowInteropHelper(_win).Handle);
+                    if (src != null) src.AddHook(ImeMessageHook);
+                }
+                catch { }
+            };
+            // 输入框允许输入法的局部标记 + 打开时焦点落在根容器上（空窗口按键不落进输入框）
+            _win.Loaded += (s, e) =>
+            {
+                try
+                {
+                    if (_textImeAllowed) EnableImeForInputs(_host);
+                    if (!IsTextFocused())
+                    {
+                        _host.Focusable = true;
+                        _host.FocusVisualStyle = null;
+                        _host.Focus();
+                    }
+                    // 前台但没有输入框持焦时拦掉可打印按键（输入法因此收不到，不会弹候选窗）
+                    // 预览窗口（_textImeAllowed=false）不装：它的字母键要交给窗口自己的快捷键处理，
+                    // 里面唯一的输入框是纯数字比例框，本来也不该有输入法
+                    if (_textImeAllowed && _shield == null)
+                    {
+                        IntPtr hh = new WindowInteropHelper(_win).Handle;
+                        if (hh != IntPtr.Zero)
+                        {
+                            _shield = new KeyboardShield(hh, () => IsTextFocused());
+                            _shield.Install();
+                        }
+                    }
+                }
+                catch { }
+            };
+            _win.Closed += (s, e) => { try { if (_shield != null) _shield.Uninstall(); } catch { } };
+            _win.AddHandler(Keyboard.GotKeyboardFocusEvent, new KeyboardFocusChangedEventHandler((s, e) =>
+            {
+                // 输入框重新拿到焦点时恢复它与窗口的输入法关联
+                if (e.NewFocus is System.Windows.Controls.Primitives.TextBoxBase) SetIme(false);
+            }), true);
+            _win.AddHandler(Keyboard.LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler((s, e) =>
+            {
+                if (e.OldFocus is System.Windows.Controls.Primitives.TextBoxBase
+                    && !(e.NewFocus is System.Windows.Controls.Primitives.TextBoxBase)) SetIme(true);
+            }), true);
+            _win.PreviewMouseLeftButtonDown += (s, e) =>
+            {
+                try
+                {
+                    if (FindUp(e.OriginalSource, typeof(System.Windows.Controls.Primitives.TextBoxBase)) != null) return; // 点在输入框内：交给输入框自己聚焦
+                    Drop();
+                    // 其余区域（列表/空白）点击后复查一次，防止目标控件在本次事件之后把焦点抢回旧输入框
+                    if (FindUp(e.OriginalSource, typeof(System.Windows.Controls.Button)) == null)
+                        _win.Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Input,
+                            new Action(() => Drop()));
+                }
+                catch { }
+            };
+        }
+
+        // 给窗口里所有输入框打上"本控件允许输入法"的局部标记（局部值优先于根容器的继承值），
+        // 这样根容器关着输入法也不会影响点进输入框后打中文
+        void EnableImeForInputs(DependencyObject root)
+        {
+            if (root == null) return;
+            var queue = new Queue<DependencyObject>();
+            queue.Enqueue(root);
+            while (queue.Count > 0)
+            {
+                DependencyObject cur = queue.Dequeue();
+                if (cur is System.Windows.Controls.Primitives.TextBoxBase)
+                {
+                    try { System.Windows.Input.InputMethod.SetIsInputMethodEnabled(cur, true); } catch { }
+                }
+                int n = 0;
+                try { n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(cur); } catch { n = 0; }
+                for (int i = 0; i < n; i++)
+                {
+                    DependencyObject child = null;
+                    try { child = System.Windows.Media.VisualTreeHelper.GetChild(cur, i); } catch { }
+                    if (child != null) queue.Enqueue(child);
+                }
+            }
+        }
+
+        // 主动清理：取消拼音组合 → 清 WPF 焦点 → 焦点落窗口根容器 → 断输入法
+        public void Drop()
+        {
+            if (!IsTextFocused()) return;
+            try
+            {
+                IntPtr hh = new WindowInteropHelper(_win).Handle;
+                IntPtr himc = ImmGetContext(hh);
+                if (himc != IntPtr.Zero)
+                {
+                    ImmNotifyIME(himc, 0x0011 /*NI_COMPOSITIONSTR*/, 0x0015 /*CPS_CANCEL*/, 0);
+                    ImmReleaseContext(hh, himc);
+                }
+            }
+            catch { }
+            Keyboard.ClearFocus();
+            FocusManager.SetFocusedElement(_win, null);
+            _host.Focusable = true;
+            _host.FocusVisualStyle = null; // 焦点只是"收容所"，不能画出虚线焦点框改变观感
+            _host.Focus();
+            SetIme(true);
+            if (_afterDrop != null) _afterDrop();
+        }
+
+        void SetIme(bool detach)
+        {
+            try
+            {
+                IntPtr hh = new WindowInteropHelper(_win).Handle;
+                if (hh == IntPtr.Zero) return;
+                if (detach)
+                {
+                    if (_imeDetached) return;
+                    IntPtr cur = ImmAssociateContext(hh, IntPtr.Zero);
+                    if (cur != IntPtr.Zero) { _savedHimc = cur; _imeDetached = true; }
+                }
+                else if (_imeDetached && _savedHimc != IntPtr.Zero)
+                {
+                    ImmAssociateContext(hh, _savedHimc);
+                    _imeDetached = false;
+                }
+            }
+            catch { }
+        }
+
+        // 输入法消息钩子：没有输入框持焦（预览这类纯数字窗口则是任何情况）时吞掉组合消息，
+        // 避免"没聚焦却弹出候选窗/字母被输入法吃掉"，同时不影响输入框里的中文输入
+        IntPtr ImeMessageHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            bool imeMsg = (msg == 0x010D /*WM_IME_STARTCOMPOSITION*/ || msg == 0x010E /*WM_IME_ENDCOMPOSITION*/
+                        || msg == 0x010F /*WM_IME_COMPOSITION*/ || msg == 0x0286 /*WM_IME_CHAR*/);
+            if (!imeMsg) return IntPtr.Zero;
+            if (_textImeAllowed && IsTextFocused()) return IntPtr.Zero; // 输入框正在用：完全交给输入法
+            handled = true;
+            return IntPtr.Zero;
+        }
+
+        // 从事件源往上找指定类型的祖先（遇到 Window 停止）；非可视对象直接返回 null
+        static DependencyObject FindUp(object src, Type t)
+        {
+            DependencyObject d = src as DependencyObject;
+            while (d != null)
+            {
+                try { if (t.IsInstanceOfType(d)) return d; } catch { return null; }
+                if (d is Window) return null;
+                try { d = System.Windows.Media.VisualTreeHelper.GetParent(d); } catch { return null; }
+            }
+            return null;
+        }
+    }
+
+    // 低级键盘钩子：窗口在前台、但没有任何输入框持焦时，把"可打印按键"在输入法看到之前拦掉。
+    // 这样空窗口里按字母不会弹候选窗、也不会把字母偷偷塞进上次用过的输入框；
+    // 进输入框后按键全部放行，中文输入不受影响，也不需要改动输入法状态（可逆）。
+    class KeyboardShield
+    {
+        delegate IntPtr LLProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        static extern IntPtr SetWindowsHookEx(int idHook, LLProc lpfn, IntPtr hMod, uint dwThreadId);
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        static extern bool UnhookWindowsHookEx(IntPtr hhk);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern short GetAsyncKeyState(int vKey);
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct KBDLLHOOKSTRUCT
+        {
+            public int vkCode;
+            public int scanCode;
+            public int flags;
+            public int time;
+            public IntPtr dwExtraInfo;
+        }
+
+        const int WH_KEYBOARD_LL = 13;
+        readonly IntPtr _hwnd;
+        readonly Func<bool> _textFocused;
+        IntPtr _hook = IntPtr.Zero;
+        LLProc _proc; // 必须保留引用，否则被回收后钩子回调会崩
+
+        public KeyboardShield(IntPtr hwnd, Func<bool> textFocused)
+        {
+            _hwnd = hwnd;
+            _textFocused = textFocused;
+        }
+
+        public void Install()
+        {
+            if (_hook != IntPtr.Zero) return;
+            _proc = new LLProc(Callback);
+            _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, IntPtr.Zero, 0);
+        }
+
+        public void Uninstall()
+        {
+            if (_hook == IntPtr.Zero) return;
+            try { UnhookWindowsHookEx(_hook); } catch { }
+            _hook = IntPtr.Zero;
+            _proc = null;
+        }
+
+        IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                int wp = wParam.ToInt32();
+                // 按下（WM_KEYDOWN 0x100 / WM_SYSKEYDOWN 0x104）和抬起（0x101 / 0x105）都拦，输入法一组上下文都收不到
+                if (nCode >= 0 && (wp == 0x0100 || wp == 0x0104 || wp == 0x0101 || wp == 0x0105)
+                    && GetForegroundWindow() == _hwnd)
+                {
+                    bool text = false;
+                    try { text = _textFocused(); } catch { text = true; } // 判断失败就放行，绝不吞输入
+                    if (!text && !ModifierDown())
+                    {
+                        KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)System.Runtime.InteropServices.Marshal.PtrToStructure(
+                            lParam, typeof(KBDLLHOOKSTRUCT));
+                        if (IsPrintable(k.vkCode))
+                        {
+                            return (IntPtr)1; // 吃掉：输入法与窗口都收不到
+                        }
+                    }
+                }
+            }
+            catch { }
+            return CallNextHookEx(_hook, nCode, wParam, lParam);
+        }
+
+        static bool ModifierDown()
+        {
+            return GetAsyncKeyState(0x11) < 0 || GetAsyncKeyState(0x12) < 0
+                || GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0;
+        }
+
+        static bool IsPrintable(int vk)
+        {
+            if (vk >= 0x30 && vk <= 0x39) return true; // 0-9
+            if (vk >= 0x41 && vk <= 0x5A) return true; // A-Z
+            if (vk >= 0x60 && vk <= 0x69) return true; // 小键盘 0-9
+            if (vk == 0x20) return true;               // 空格
+            if (vk >= 0xBA && vk <= 0xC0) return true; // ; = , - . /
+            if (vk >= 0xDB && vk <= 0xDE) return true; // [ \ ] '
+            return false;
+        }
     }
 
     public partial class App : Application
@@ -3017,6 +4082,14 @@ namespace PickLight
         [STAThread]
         public static void Main()
         {
+            // 强制启用 TLS 1.1/1.2：.NET 4.0 默认仅 SSL3/TLS1.0，GitHub API 要求 TLS1.2+，
+            // 不设置会导致"未能创建 SSL/TLS 安全通道"（必须放在任何 HTTPS 请求之前）
+            try
+            {
+                System.Net.ServicePointManager.SecurityProtocol =
+                    (System.Net.SecurityProtocolType)(0xC0 | 0x300 | 0xC00); // Tls | Tls11 | Tls12（4.0 枚举无 Tls12，用数值）
+            }
+            catch { }
             // 单例互斥：只允许一个实例运行。重复启动（双击 exe）时激活已有窗口后退出，
             // 杜绝多实例窗口重叠导致点击落到被遮挡窗口上的"点不开/无响应"问题
             bool createdNew;
