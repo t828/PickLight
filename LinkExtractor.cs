@@ -3774,16 +3774,25 @@ namespace PickLight
                     "setlocal\r\n" +
                     "set LOG=\"" + log + "\"\r\n" +
                     "echo [%DATE% %TIME%] begin replace >> %LOG% 2>&1\r\n" +
-                    "ping -n 3 127.0.0.1 >nul\r\n" +
-                    "taskkill /im PickLight.exe /f >> %LOG% 2>&1\r\n" +
                     "set /a W=0\r\n" +
                     ":wait\r\n" +
                     "tasklist /fi \"imagename eq PickLight.exe\" 2>nul | find /i \"PickLight.exe\" >nul\r\n" +
                     "if errorlevel 1 goto copy\r\n" +
                     "set /a W+=1\r\n" +
-                    "if %W% geq 10 goto copy\r\n" +
+                    "if %W% geq 10 goto force\r\n" +
                     "ping -n 2 127.0.0.1 >nul\r\n" +
                     "goto wait\r\n" +
+                    ":force\r\n" +
+                    "echo [%DATE% %TIME%] still running, force kill >> %LOG% 2>&1\r\n" +
+                    "taskkill /im PickLight.exe /f >> %LOG% 2>&1\r\n" +
+                    "set /a K=0\r\n" +
+                    ":wait2\r\n" +
+                    "tasklist /fi \"imagename eq PickLight.exe\" 2>nul | find /i \"PickLight.exe\" >nul\r\n" +
+                    "if errorlevel 1 goto copy\r\n" +
+                    "set /a K+=1\r\n" +
+                    "if %K% geq 5 goto copy\r\n" +
+                    "ping -n 2 127.0.0.1 >nul\r\n" +
+                    "goto wait2\r\n" +
                     ":copy\r\n" +
                     "echo [%DATE% %TIME%] process gone after %W% waits >> %LOG% 2>&1\r\n" +
                     "set /a N=0\r\n" +
