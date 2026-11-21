@@ -13,5 +13,4 @@ error.log
 update_tmp.bat
 
 # 本地更新链路验证用的临时构建目录（仅测试用，不入库）
-_verify100/
-_verify_run/
+_verify*/
