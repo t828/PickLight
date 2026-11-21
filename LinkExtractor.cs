@@ -3733,6 +3733,12 @@ namespace PickLight
                         wc.DownloadFile(exeUrl, newExe);
                     }
                     long size = new System.IO.FileInfo(newExe).Length;
+                    // 下载到的是网页（限流页/404 页）时不能当成安装包，先验 PE 头
+                    using (var fs = System.IO.File.OpenRead(newExe))
+                    {
+                        if (fs.Length < 1024 || fs.ReadByte() != 0x4D || fs.ReadByte() != 0x5A)
+                            throw new Exception("下载到的文件不是有效的程序文件，请到 GitHub Releases 页面手动下载。");
+                    }
                     string sz = size >= 1048576 ? (size / 1048576.0).ToString("0.0") + " MB" : (size / 1024.0).ToString("0") + " KB";
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
@@ -3760,14 +3766,44 @@ namespace PickLight
                 string exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
                 string dir = System.IO.Path.GetDirectoryName(exePath);
                 string bat = System.IO.Path.Combine(dir, "update_tmp.bat");
+                string log = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "PickLightUpdate", "update_log.txt");
+                // 覆盖失败的两个常见原因：进程刚退出时 exe 的可执行映像还占着文件、或被安全软件短暂锁住。
+                // 所以先等进程真正消失，再对 copy 做多次重试，全程写日志；失败时保留下载好的新包，不静默吞掉。
                 System.IO.File.WriteAllText(bat,
                     "@echo off\r\n" +
+                    "setlocal\r\n" +
+                    "set LOG=\"" + log + "\"\r\n" +
+                    "echo [%DATE% %TIME%] begin replace >> %LOG% 2>&1\r\n" +
                     "timeout /t 2 /nobreak >nul\r\n" +
-                    "taskkill /im PickLight.exe /f >nul 2>&1\r\n" +
-                    "copy /y \"" + newExe + "\" \"" + exePath + "\" >nul\r\n" +
+                    "taskkill /im PickLight.exe /f >> %LOG% 2>&1\r\n" +
+                    "set /a W=0\r\n" +
+                    ":wait\r\n" +
+                    "tasklist /fi \"imagename eq PickLight.exe\" 2>nul | find /i \"PickLight.exe\" >nul\r\n" +
+                    "if errorlevel 1 goto copy\r\n" +
+                    "set /a W+=1\r\n" +
+                    "if %W% geq 10 goto copy\r\n" +
+                    "ping -n 2 127.0.0.1 >nul\r\n" +
+                    "goto wait\r\n" +
+                    ":copy\r\n" +
+                    "echo [%DATE% %TIME%] process gone after %W% waits >> %LOG% 2>&1\r\n" +
+                    "set /a N=0\r\n" +
+                    ":retry\r\n" +
+                    "copy /y \"" + newExe + "\" \"" + exePath + "\" >> %LOG% 2>&1\r\n" +
+                    "if not errorlevel 1 goto copied\r\n" +
+                    "set /a N+=1\r\n" +
+                    "if %N% geq 6 goto failed\r\n" +
+                    "ping -n 2 127.0.0.1 >nul\r\n" +
+                    "goto retry\r\n" +
+                    ":copied\r\n" +
+                    "echo [%DATE% %TIME%] copied ok, retries=%N% >> %LOG% 2>&1\r\n" +
                     "start \"\" \"" + exePath + "\"\r\n" +
-                    "del /f /q \"" + bat + "\" >nul 2>&1\r\n" +
-                    "del /f /q \"" + newExe + "\" >nul 2>&1\r\n",
+                    "del /f /q \"" + newExe + "\" >nul 2>&1\r\n" +
+                    "goto quit\r\n" +
+                    ":failed\r\n" +
+                    "echo [%DATE% %TIME%] copy FAILED, retries=%N%, new exe kept at " + newExe + " >> %LOG% 2>&1\r\n" +
+                    "start \"\" \"" + exePath + "\"\r\n" +
+                    ":quit\r\n" +
+                    "del /f /q \"" + bat + "\" >nul 2>&1\r\n",
                     new System.Text.UTF8Encoding(false));
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = bat, WorkingDirectory = dir, UseShellExecute = true });
                 Close(); // 关闭主窗口（触发 Closing → 保存历史/窗口状态）
