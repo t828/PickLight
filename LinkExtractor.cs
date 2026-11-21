@@ -3467,12 +3467,19 @@ namespace PickLight
                     }
                     if (url.Length == 0)
                     {
-                        ShowNotice("发现新版本", "发现新版本 v" + tag + "，但该 Release 未附带 .exe 安装包，请到 GitHub Releases 页面手动下载。", true);
+                        ShowNotice("发现新版本", "发现新版本 " + VTag(tag) + "，但该 Release 未附带 .exe 安装包，请到 GitHub Releases 页面手动下载。", true);
                         return;
                     }
                     ShowUpdateDialog(tag, desc, url);
                 }));
             });
+        }
+
+        // 版本号显示：tag 本身可能带 v（如 v1.0.1），统一成单个 "v" 前缀，避免出现 "vv1.0.1"
+        static string VTag(string tag)
+        {
+            if (string.IsNullOrEmpty(tag)) return "";
+            return "v" + tag.TrimStart('v', 'V');
         }
 
         // JSON 字符串解码：把 \\r\\n、\\"、\\\\ 等转义还原为真实字符（GitHub body 是 JSON 字符串）
@@ -3517,8 +3524,8 @@ namespace PickLight
             dlg.PreviewKeyDown += (s2, e2) => { if (e2.Key == Key.Escape) dlg.Close(); }; // ESC 关闭
             var root = new StackPanel { Margin = new Thickness(20, 16, 20, 14) };
             var theme = new SolidColorBrush(Color.FromRgb(15, 118, 110));
-            root.Children.Add(new TextBlock { Text = "发现新版本 v" + latestTag, FontSize = 15, FontWeight = FontWeights.SemiBold, Foreground = theme, Margin = new Thickness(0, 0, 0, 6) });
-            root.Children.Add(new TextBlock { Text = "当前版本 v" + AppVersion + " → 最新版本 v" + latestTag, FontSize = 13, Foreground = (Brush)FindResource("TextSecondary") });
+            root.Children.Add(new TextBlock { Text = "发现新版本 " + VTag(latestTag), FontSize = 15, FontWeight = FontWeights.SemiBold, Foreground = theme, Margin = new Thickness(0, 0, 0, 6) });
+            root.Children.Add(new TextBlock { Text = "当前版本 v" + AppVersion + " → 最新版本 " + VTag(latestTag), FontSize = 13, Foreground = (Brush)FindResource("TextSecondary") });
             if (note.Length > 0)
             {
                 root.Children.Add(new TextBlock { Text = "更新说明：", FontSize = 13, FontWeight = FontWeights.SemiBold, Foreground = (Brush)FindResource("TextPrimary"), Margin = new Thickness(0, 10, 0, 4) });
@@ -3696,11 +3703,11 @@ namespace PickLight
                     }
                     if (url.Length == 0)
                     {
-                        result.Text = "发现新版本 v" + tag + "，但该版本未附带 PickLight.exe，请到 GitHub Releases 页面手动下载。";
+                        result.Text = "发现新版本 " + VTag(tag) + "，但该版本未附带 PickLight.exe，请到 GitHub Releases 页面手动下载。";
                         result.Foreground = themeBrush;
                         return;
                     }
-                    result.Text = "发现新版本 v" + tag + "，正在打开更新窗口…";
+                    result.Text = "发现新版本 " + VTag(tag) + "，正在打开更新窗口…";
                     result.Foreground = themeBrush;
                     dlg.Close();
                     ShowUpdateDialog(tag, desc, url);
