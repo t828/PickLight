@@ -14,3 +14,7 @@ update_tmp.bat
 
 # 本地更新链路验证用的临时构建目录（仅测试用，不入库）
 _verify*/
+
+# 本地调试/测试目录（不入库）
+_bugrun/
+_testdata/

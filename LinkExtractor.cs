@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
@@ -21,6 +21,9 @@ using System.ComponentModel;
 
 namespace PickLight
 {
+    // WinEvent 钩子回调（文档级声明：主窗口与 ffplay 附属窗口钩子共用同一个类型）
+    delegate void WinEventProc(IntPtr hook, int ev, IntPtr hwnd, int idObject, int idChild, int threadId, int time);
+
     // ComboBoxItem 附加属性：存下拉项的日期副标题，供列表项模板绑定（选中框只显示名称，日期只在展开列表里显示）
     public static class ComboItemExt
     {
@@ -91,7 +94,7 @@ namespace PickLight
         TextBlock _countText;
         CheckBox _filterCache;
         // ---- 在线更新（GitHub Releases）----
-        const string AppVersion = "1.0.2"; // 当前版本号（更新检查基准）
+        const string AppVersion = "1.0.3"; // 当前版本号（更新检查基准）
         const string UpdateRepoDefault = "t828/PickLight"; // GitHub 仓库(owner/repo)：更新源，发布时在此配置
         string _updateRepo = UpdateRepoDefault;
         bool _autoUpdate = true; // 启动时自动检查更新（settings.ini 的 AutoUpdate=0 可关闭，手动「检查更新」按钮始终可用）
@@ -106,10 +109,138 @@ namespace PickLight
         MediaElement _currentMedia; // 预览窗口当前内嵌播放的媒体
         System.Diagnostics.Process _currentFfplay; // 预览窗口当前启动的 ffplay 播放进程
         IntPtr _embeddedHwnd; // 伪嵌入：当前叠放在预览弹窗内容区上的 ffplay 窗口句柄（随弹窗移动/缩放同步）
+        MouseShield _mouseShield; // 预览期间把落在 ffplay 矩形上的点击/滚轮吃掉（它单击会暂停、双击会切全屏并 warp 鼠标）
+        FfplayHideHook _ffHook;   // 当前叠放播放用的窗口事件钩子（每次 ffplay 抢着显示都会被当场按回去）
+        int _ffPinX = -3000;      // ffplay 建窗/自发显示期间被“按”到的位置：直接就是内容区里画面该落的地方，
+        int _ffPinY = -3000;      // 这样那一帧只会出现在内容区内（被加载帘遮着），不会在屏幕中央闪一下
+        bool _ffSettling;     // 伪嵌入：ffplay 尚在“隐藏校正”阶段，此时的同步定位只移动不显示，避免提前露出跳位
+        volatile bool _suppressShow; // 伪嵌入：ffplay 初始化期间反复 SW_HIDE，压掉它自己那几次 SDL_ShowWindow 的闪现
+        RECT _ffTargetRect;   // 伪嵌入：目标叠放矩形（屏幕坐标），用于判断 ffplay 是否已被自身尺寸调整挤走
+        double _ffAspect = 0; // 伪嵌入：视频宽高比（从 ffplay 自己按视频尺寸重设的那一次读出来），0 = 未知，按满铺处理
         Window _previewWindow; // 预览弹窗（单例，避免多弹窗互相抢占播放）
 
         [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
         static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags);
+        // 叠放式预览（ffplay 伪嵌入）需要把它当"附属窗口"处理：去掉任务栏按钮、禁止抢焦点、就位前先隐藏
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int GetWindowLong(IntPtr hwnd, int index);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int SetWindowLong(IntPtr hwnd, int index, int value);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hwnd, int cmd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetForegroundWindow(IntPtr hwnd);
+        // 窗口事件钩子：ffplay 的 SDL 窗口一创建就隐藏，避免它先在屏幕中央闪一下
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr SetWinEventHook(int min, int max, IntPtr hmod, WinEventProc proc, int pid, int tid, int flags);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool UnhookWinEvent(IntPtr hook);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int GetWindowThreadProcessId(IntPtr hwnd, out int pid);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool IsWindowVisible(IntPtr hwnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool EnableWindow(IntPtr hwnd, bool enable);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool IsWindow(IntPtr hwnd);
+        // 按进程号枚举顶层窗口：能拿到“还没显示”的窗口，比 Process.MainWindowHandle 早几百毫秒
+        delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool EnumWindows(EnumWindowsProc proc, IntPtr lParam);
+
+        // 找属于指定进程、尺寸像个播放窗口的顶层窗口（隐藏的也算）：ffplay 的 SDL 窗口建出来就是 640×480 或 -x/-y 的尺寸
+        static IntPtr FindTopWindowOfPid(int pid)
+        {
+            IntPtr found = IntPtr.Zero;
+            EnumWindowsProc cb = (h, l) =>
+            {
+                try
+                {
+                    int p;
+                    GetWindowThreadProcessId(h, out p);
+                    if (p != pid) return true;
+                    RECT r;
+                    if (!GetWindowRect(h, out r)) return true;
+                    if (r.Right - r.Left < 100 || r.Bottom - r.Top < 100) return true; // 过滤 IME/辅助小窗
+                    found = h;
+                    return false;
+                }
+                catch { return true; }
+            };
+            try { EnumWindows(cb, IntPtr.Zero); } catch { }
+            return found;
+        }
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetLayeredWindowAttributes(IntPtr hwnd, int key, byte alpha, int flags);
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder sb, int max);
+        // DWM cloak：合成器层面直接不画这个窗口，且不依赖目标窗口所在线程（初始化期间 ffplay 线程被占满也不会卡住）
+        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+        // 让窗口在合成器里“不存在”。这才是真正意义上的不可见：不依赖 ShowWindow（跨线程调用在 ffplay 忙时会被挂起），
+        // 也不依赖分层 alpha（建窗阶段加 LAYERED 会打断 SDL 初始化）。DWMWA_CLOAK = 13
+        // 实测：跨进程调用返回 E_ACCESSDENIED（0x80070005），只能藏自己进程的窗口——所以它挡不住 ffplay，
+        // 只留作候选，真正解决“闪一下”的是把图片改成 WPF 原生逐帧播放（不再起 ffplay）。
+        static bool SetCloak(IntPtr hwnd, bool on)
+        {
+            try { int v = on ? 1 : 0; return DwmSetWindowAttribute(hwnd, 13, ref v, 4) == 0; }
+            catch { return false; }
+        }
+        // 动画 webp 每帧时长：RIFF 顶层遍历 chunk，取 ANMF 帧头第 12~14 字节（24 位毫秒）
+        static int[] WebpFrameDelays(byte[] d, int frameCount)
+        {
+            var list = new System.Collections.Generic.List<int>();
+            try
+            {
+                int off = 12;
+                while (off + 8 <= d.Length)
+                {
+                    string id = "" + (char)d[off] + (char)d[off + 1] + (char)d[off + 2] + (char)d[off + 3];
+                    int size = d[off + 4] | (d[off + 5] << 8) | (d[off + 6] << 16) | (d[off + 7] << 24);
+                    int body = off + 8;
+                    if (id == "ANMF" && body + 15 < d.Length)
+                    {
+                        int dur = d[body + 12] | (d[body + 13] << 8) | (d[body + 14] << 16);
+                        list.Add(dur < 10 ? 100 : dur);
+                    }
+                    if (size < 0) break;
+                    off = body + size + (size & 1);
+                }
+            }
+            catch { }
+            int[] res = new int[frameCount];
+            for (int i = 0; i < frameCount; i++) res[i] = (i < list.Count ? list[i] : 100);
+            return res;
+        }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct RECT
+        {
+            public int Left, Top, Right, Bottom;
+        }
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr GetWindow(IntPtr hwnd, int cmd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool PeekMessage(out MSG msg, IntPtr hwnd, int min, int max, int remove);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool TranslateMessage(ref MSG msg);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr DispatchMessage(ref MSG msg);
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct MSG
+        {
+            public IntPtr hwnd;
+            public int message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public int time;
+            public int ptX;
+            public int ptY;
+            public int lPrivate;
+        }
 
         // 预览弹窗整体断开输入法（imm32）：缩放比例输入是纯数字不需要中文输入法，
         // 断开后弹窗内按 W/A/S/D/R 等字母键不会触发输入法候选/被吞，键盘快捷键稳定可用
@@ -994,13 +1125,24 @@ namespace PickLight
             });
         }
 
-        System.Diagnostics.Process LaunchFfplay(string ffplayPath, string url, string source, bool embed = false)
+        System.Diagnostics.Process LaunchFfplay(string ffplayPath, string url, string source, bool embed = false, int embedW = 0, int embedH = 0)
         {
-            // 隐藏控制台黑窗（CreateNoWindow + UseShellExecute=false），窗口限制 960×540 避免全屏；
-            // -loop 0 循环播放（网络流需服务器支持 seek，CDN 一般支持）；embed=true 时加 -noborder（嵌入预览弹窗内无边框）
+            // 隐藏控制台黑窗（CreateNoWindow + UseShellExecute=false）；-loop 0 循环播放（网络流需服务器支持 seek，CDN 一般支持）。
+            // 嵌入模式：用 -vf scale 直接把输出缩放成目标尺寸。
+            // 这是唯一同时解决“比例错（画面被放大两倍并裁掉右侧）”和“透明区变黑”的写法：
+            // ffplay 的窗口尺寸是由 -vf 的输出尺寸决定的（实测窗口刚好 650x366），画面完整等比落进去；
+            // 而事后 SetWindowPos 改尺寸不会触发 SDL 视口更新，就会出现裁切/放大。
+            string sizeArgs;
+            if (!embed) sizeArgs = " -x 960 -y 540";
+            else if (embedW > 8 && embedH > 8)
+                // -x/-y 决定窗口创建时的尺寸（SDL 客户区就是 WxH），-vf 决定画面输出的尺寸，两者必须一致：
+                // 只给 -vf 时 ffplay 仍以 640x480 建客户区，事后 SetWindowPos 改成 650x366 只会裁外层窗口，
+                // SDL 客户区还是 640x480，画面就会被裁/错位（顶部出现一条黑边）。
+                sizeArgs = " -x " + embedW + " -y " + embedH + " -vf scale=" + embedW + ":" + embedH + ":flags=lanczos";
+            else sizeArgs = "";
             var psi = new System.Diagnostics.ProcessStartInfo();
             psi.FileName = ffplayPath;
-            psi.Arguments = "-loop 0 -x 960 -y 540" + (embed ? " -noborder" : "") + " -window_title \"" + (source ?? "播放").Replace("\"", "'") + "\" \"" + url + "\"";
+            psi.Arguments = "-loop 0" + (embed ? " -noborder" : "") + sizeArgs + " -window_title \"" + (source ?? "播放").Replace("\"", "'") + "\" \"" + url + "\"";
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             return System.Diagnostics.Process.Start(psi);
@@ -2433,6 +2575,8 @@ namespace PickLight
             // ffplay 嵌入宿主：webm/ogg/mov 等 WMF 不支持的格式在弹窗内播放（SetParent 嵌入），与图片同区展示
             var mediaHost = new MediaHost { Visibility = Visibility.Collapsed, Margin = new Thickness(12) };
             content.Children.Add(mediaHost);
+            // 提示文字要压在最上层（mediaHost 是后加的，默认会盖住 hint，加载提示就看不见了）
+            Panel.SetZIndex(hint, 20);
             contentHost.Child = content;
             Grid.SetRow(contentHost, 0);
             root.Children.Add(contentHost);
@@ -2551,21 +2695,128 @@ namespace PickLight
                 catch { }
             };
 
-            // 伪嵌入：把 ffplay 无边框窗口精确叠放到预览弹窗内容区位置并置于弹窗之上（不 SetParent——
-            // SDL 窗口 SetParent 后画面会冻结，叠放方式保持 ffplay 正常渲染、画面动态）
-            Action<IntPtr> placeFfplay = (ffHwnd) =>
+            // 分层窗口透明度：0 = 完全不可见（但窗口仍在、视频照常解码），255 = 正常显示。
+            // 用它代替“藏/显窗口”来屏蔽 ffplay 初始化的自我重设，既不闪窗也不抢时序
+            Action<IntPtr, byte> SetLayeredAlpha = (ffHwnd, alpha) =>
             {
                 try
                 {
-                    var pt = mediaHost.PointToScreen(new System.Windows.Point(0, 0));
-                    int w = Math.Max(50, (int)mediaHost.ActualWidth);
-                    int h = Math.Max(50, (int)mediaHost.ActualHeight);
-                    IntPtr winH = new System.Windows.Interop.WindowInteropHelper(win).Handle;
-                    SetWindowPos(ffHwnd, winH, (int)pt.X, (int)pt.Y, w, h, 0x0040 | 0x0010); // SWP_SHOWWINDOW | SWP_NOACTIVATE
-                    _embeddedHwnd = ffHwnd;
+                    int ex = GetWindowLong(ffHwnd, -20);
+                    int baseFlags = 0x80 /*TOOLWINDOW*/ | 0x08000000 /*NOACTIVATE*/ | 0x80000 /*WS_EX_LAYERED*/;
+                    // 恒加 WS_EX_TRANSPARENT：点击穿透，ffplay 收不到鼠标（否则单击暂停、双击切全屏会毁掉叠放位置）
+                    int clickThrough = 0x20 /*WS_EX_TRANSPARENT*/;
+                    SetWindowLong(ffHwnd, -20, (ex & ~0x20) | baseFlags | clickThrough);
+                    SetLayeredWindowAttributes(ffHwnd, 0, alpha, 2 /*LWA_ALPHA*/);
                 }
                 catch { }
             };
+
+            // 露出时不能再用“分层窗口 alpha=255”：一旦给窗口加上 WS_EX_LAYERED，Windows 只按统一的
+            // 整体 alpha 合成，ffplay 自带的逐像素透明（带 alpha 的 webp）就全变成黑色了
+            // （实测同一命令单独跑 ffplay 时透明区能透出棋盘格，加上分层就变整片黑）。
+            // 所以露出 = 摘掉 WS_EX_LAYERED / WS_EX_TRANSPARENT，让 DWM 按逐像素 alpha 正常合成。
+            Action<IntPtr> RevealNative = (ffHwnd) =>
+            {
+                try
+                {
+                    // 先撤掉 cloak（这才是真正挡住它不显示的那一层），再摘 LAYERED 让逐像素透明度正常合成
+                    SetCloak(ffHwnd, false);
+                    int ex = GetWindowLong(ffHwnd, -20);
+                    SetWindowLong(ffHwnd, -20, (ex & ~0x80000 /*WS_EX_LAYERED*/) | 0x20 /*TRANS: 点击穿透*/ | 0x80 | 0x08000000);
+                }
+                catch { }
+            };
+
+            // 加载帘：ffplay 建窗后会在初始化尾声自己 SDL_ShowWindow 一次，位置是它自己算的屏幕居中（不在内容区），
+            // 那一帧只靠 Hide/令牌挡不住（实测仍有 1~4 个 8ms 采样能看到）。用一块盖在内容区上方的白底帘子把它遮住，
+            // 等画面真正就位再揭帘——用户看到的就是“内容区一直在加载，然后图片直接出现”，中间不会有窗口闪现。
+            Window _curtain = null;
+            IntPtr _curtainHwnd = IntPtr.Zero;
+
+            Action HideCurtain = () =>
+            {
+                try { if (_curtain != null) _curtain.Close(); } catch { }
+                _curtain = null;
+                _curtainHwnd = IntPtr.Zero;
+            };
+
+            Action ShowCurtain = () =>
+            {
+                try
+                {
+                    HideCurtain();
+                    if (mediaHost.ActualWidth < 20 || mediaHost.ActualHeight < 20) return;
+                    var c0 = mediaHost.PointToScreen(new System.Windows.Point(0, 0));
+                    var c1 = mediaHost.PointToScreen(new System.Windows.Point(mediaHost.ActualWidth, mediaHost.ActualHeight));
+                    var dp = VisualTreeHelper.GetDpi(win);
+                    var grid = new System.Windows.Controls.Grid();
+                    var bg = new System.Windows.Controls.Border();
+                    // 用 ffplay 自己画透明区时的那种浅灰底色（实测 237/222 两色棋盘），不用我们预览窗的
+                    // 255/216 细棋盘——否则揭帘那一下格子尺寸和颜色都会跳一下，看着像闪了一下
+                    bg.Background = new SolidColorBrush(Color.FromRgb(236, 237, 238));
+                    grid.Children.Add(bg);
+                    var tb = new TextBlock();
+                    tb.Text = "正在加载动画…";
+                    tb.FontSize = 13;
+                    tb.Foreground = new SolidColorBrush(Color.FromRgb(120, 134, 155));
+                    tb.HorizontalAlignment = HorizontalAlignment.Center;
+                    tb.VerticalAlignment = VerticalAlignment.Center;
+                    grid.Children.Add(tb);
+                    var cw = new Window();
+                    cw.WindowStyle = WindowStyle.None;
+                    cw.ResizeMode = ResizeMode.NoResize;
+                    cw.ShowInTaskbar = false;
+                    cw.Topmost = true;
+                    cw.ShowActivated = false;
+                    cw.Focusable = false;
+                    cw.Background = Brushes.White;
+                    cw.Content = grid;
+                    cw.Left = c0.X / dp.DpiScaleX;
+                    cw.Top = c0.Y / dp.DpiScaleY;
+                    cw.Width = (c1.X - c0.X) / dp.DpiScaleX;
+                    cw.Height = (c1.Y - c0.Y) / dp.DpiScaleY;
+                    cw.Show();
+                    _curtain = cw;
+                    _curtainHwnd = new WindowInteropHelper(cw).Handle;
+                }
+                catch { _curtain = null; _curtainHwnd = IntPtr.Zero; }
+            };
+
+            // 伪嵌入：把 ffplay 无边框窗口精确叠放到预览弹窗内容区位置并置于弹窗之上（不 SetParent——
+            // SDL 窗口 SetParent 后画面会冻结，叠放方式保持 ffplay 正常渲染、画面动态）
+            // show=false 时只移动不显示，用于窗口就位前的「静默校正」，用户看不到任何跳位/闪窗
+            Action<IntPtr, bool> placeFfplayCore = (ffHwnd, doShow) =>
+            {
+                try
+                {
+                    // 用两个角点换算成设备像素：rect 是物理像素，而 ActualWidth/Height 是 DIP，
+                    // 系统缩放 125%/150% 时直接混用会让叠放窗口比内容区小一圈（画面被裁/留白）
+                    var p0 = mediaHost.PointToScreen(new System.Windows.Point(0, 0));
+                    var p1 = mediaHost.PointToScreen(new System.Windows.Point(mediaHost.ActualWidth, mediaHost.ActualHeight));
+                    int cw = Math.Max(50, (int)Math.Round(p1.X - p0.X));
+                    int ch = Math.Max(50, (int)Math.Round(p1.Y - p0.Y));
+                    // 按视频真实宽高比等比缩放（contain）：ffplay 会把自己的画面拉伸铺满窗口，
+                    // 直接给内容区尺寸会把 16:9 的动画挤扁，所以这里算出带黑边的居中矩形
+                    int w = cw, h = ch, x = (int)Math.Round(p0.X), y = (int)Math.Round(p0.Y);
+                    if (_ffAspect > 0.05)
+                    {
+                        double a = _ffAspect;
+                        if (cw / (double)ch > a) { h = ch; w = Math.Max(8, (int)Math.Round(ch * a)); }
+                        else { w = cw; h = Math.Max(8, (int)Math.Round(cw / a)); }
+                        x = (int)Math.Round(p0.X) + (cw - w) / 2;
+                        y = (int)Math.Round(p0.Y) + (ch - h) / 2;
+                    }
+                    // 窗口始终叠在最上层（SetWindowPos 的 HWND_TOPMOST）：自己是 alpha=0 的不可见层，
+                    // 只有露出时才真正看得见；切到别的程序时由 Deactivated 再把它调回全透明。
+                    // SWP_NOACTIVATE | (doShow ? SWP_SHOWWINDOW : 0)
+                    SetWindowPos(ffHwnd, (IntPtr)(-1), x, y, w, h, (uint)(0x0010 | (doShow ? 0x0040 : 0)));
+                    _embeddedHwnd = ffHwnd;
+                    _ffTargetRect = new RECT { Left = x, Top = y, Right = x + w, Bottom = y + h };
+                    if (doShow) RevealNative(ffHwnd);
+                }
+                catch { }
+            };
+            Action<IntPtr> placeFfplay = (ffHwnd) => placeFfplayCore(ffHwnd, true);
 
             // 启动 ffplay 并（webm/ogg/mov）叠放嵌入弹窗内容区；拿不到窗口句柄/定位失败时回退为外置播放提示
             Action<System.Diagnostics.Process, bool> startEmbedded = (proc, doEmbed) =>
@@ -2575,19 +2826,331 @@ namespace PickLight
                 mediaHost.Visibility = Visibility.Visible;
                 System.Threading.Tasks.Task.Run(() =>
                 {
+                    // 优先用窗口事件钩子：ffplay 的 SDL 窗口一创建就隐藏，用户看不到任何闪窗；
+                    // 钩子没拿到（极少数环境）再退回轮询 Process.MainWindowHandle
                     IntPtr hwnd = IntPtr.Zero;
-                    for (int i = 0; i < 60; i++) // 最多 6s 等 ffplay 窗口创建
+                    var hook = new FfplayHideHook(proc.Id);
+                    // 先算好“内容区里画面该落在哪”，交给钩子：ffplay 每次自己抢着显示时，钩子会把它按到
+                    // 这个位置而不是屏幕居中的默认位置。这样即使它抢在尺寸/透明处理之前露了一帧，
+                    // 那一帧也正好落在内容区内、被加载帘遮着，屏幕上不会出现任何“错位的窗口”。
+                    try
                     {
-                        if (proc.HasExited) return;
-                        try { proc.Refresh(); } catch { return; }
-                        if (proc.MainWindowHandle != IntPtr.Zero) { hwnd = proc.MainWindowHandle; break; }
-                        System.Threading.Thread.Sleep(100);
+                        var geo = new RECT[1];
+                        win.Dispatcher.Invoke(new Action(() =>
+                        {
+                            var a0 = mediaHost.PointToScreen(new System.Windows.Point(0, 0));
+                            var a1 = mediaHost.PointToScreen(new System.Windows.Point(mediaHost.ActualWidth, mediaHost.ActualHeight));
+                            int cw = Math.Max(50, (int)Math.Round(a1.X - a0.X));
+                            int ch = Math.Max(50, (int)Math.Round(a1.Y - a0.Y));
+                            int w2 = cw, h2 = ch;
+                            int x2 = (int)Math.Round(a0.X), y2 = (int)Math.Round(a0.Y);
+                            if (_ffAspect > 0.05)
+                            {
+                                if (cw / (double)ch > _ffAspect) { h2 = ch; w2 = Math.Max(8, (int)Math.Round(ch * _ffAspect)); }
+                                else { w2 = cw; h2 = Math.Max(8, (int)Math.Round(cw / _ffAspect)); }
+                                x2 = (int)Math.Round(a0.X) + (cw - w2) / 2;
+                                y2 = (int)Math.Round(a0.Y) + (ch - h2) / 2;
+                            }
+                            geo[0] = new RECT { Left = x2, Top = y2, Right = x2 + w2, Bottom = y2 + h2 };
+                        }));
+                        hook.TargetX = geo[0].Left;
+                        hook.TargetY = geo[0].Top;
+                        _ffPinX = geo[0].Left;
+                        _ffPinY = geo[0].Top;
+                    }
+                    catch { }
+                    try
+                    {
+                        hook.Start();
+                        // 关键：不要用 Process.MainWindowHandle 找窗口——它只在窗口“已经可见”后才返回值，
+                        // 等它返回时 ffplay 早就把自己在屏幕中央显示出来了（这就是那一下闪现）。
+                        // 改用 EnumWindows 按进程号枚举：窗口刚建出来还是隐藏状态就能拿到，通常比它显示早 300ms 以上，
+                        // 于是可以在这段时间里一直按着它隐藏，它压根没有机会出现在屏幕任何位置。
+                        IntPtr hw0 = IntPtr.Zero;
+                        for (int i = 0; i < 3000; i++)
+                        {
+                            if (proc.HasExited) return;
+                            hw0 = FindTopWindowOfPid(proc.Id);
+                            if (hw0 != IntPtr.Zero) break;
+                            System.Threading.Thread.Sleep(1);
+                        }
+                        hwnd = hw0;
+                        if (hwnd == IntPtr.Zero) hwnd = hook.WaitReady(6000);
+                    }
+                    catch { }
+                    finally { if (hwnd == IntPtr.Zero) hook.Stop(); } // 拿到窗柄则钩子继续留着：校正阶段按 ffplay 自身的显示事件立刻隐藏
+                    if (hwnd == IntPtr.Zero)
+                    {
+                        for (int i = 0; i < 1200; i++) // 最多 6s；5ms 轮询
+                        {
+                            if (proc.HasExited) return;
+                            try { proc.Refresh(); } catch { return; }
+                            if (proc.MainWindowHandle != IntPtr.Zero) { hwnd = proc.MainWindowHandle; break; }
+                            System.Threading.Thread.Sleep(5);
+                        }
+                        if (hwnd != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                ShowWindow(hwnd, 0); // SW_HIDE
+                                int ex = GetWindowLong(hwnd, -20);
+                                SetWindowLong(hwnd, -20, ex | 0x80 | 0x08000000);
+                            }
+                            catch { }
+                        }
                     }
                     if (hwnd == IntPtr.Zero) return; // 拿不到句柄：保持外置播放（无边框窗口）
                     IntPtr target = hwnd;
+                    // 拿到句柄第一件事：cloak（合成器层面不画）。ffplay 初始化尾声那几次 SDL_ShowWindow
+                    // 都在 cloak 期间，屏幕上一帧都没有；跨线程 ShowWindow 被它线程占用拖住也不影响。
+                    SetCloak(target, true);
+                    
+                    try { ShowWindow(target, 0); } catch { } // 拿到就用隐藏按住，别等后面那套流程
+                    // 钩子别停：ffplay 在初始化尾声还会自己 SDL_ShowWindow 一次（位置是它自己算的屏幕居中，
+                    // 常常落在内容区外面），那一帧 4ms 轮询要么来不及、要么正好错过。改成事件级：
+                    // 每次它要显示，钩子先收到 EVENT_OBJECT_SHOW，当场 SW_HIDE 并挪到屏幕外，用户看不到任何一帧。
+                    FfplayHideHook hookKeep = hook;
+                    _ffHook = hook;
+                    FfplayHideHook.KeepHidden = true;
+                    hookKeep.OnShown = (IntPtr hh) =>
+                    {
+                        try
+                        {
+                            ShowWindow(hh, 0);
+                            hookKeep.PinPos(hh); // 按到内容区里（被加载帘遮着），绝不落在屏幕中央
+                        }
+                        catch { }
+                    };
+                    // 第一道防线：用“反复隐藏”代替改扩展样式。改样式（WS_EX_LAYERED）会打断 SDL 初始化——
+                    // 客户区会永远停在 640×480，之后的 SetWindowPos 只会裁外层、画面被裁 + 顶部黑边。
+                    // ShowWindow(SW_HIDE) 不改样式，只是置 WS_VISIBLE=false，SDL 的尺寸流程照常走；
+                    // 在后台线程里每 8ms 按一次，ffplay 自己那几次 SDL_ShowWindow 都会被立刻按回去（用户看不到）。
+                    IntPtr tg0 = target;
+                    _suppressShow = true;
+                    // 屏蔽 ffplay 自己的鼠标交互：它是播放器，单击会暂停、双击会切全屏（窗口瞬间变成整屏、
+                    // 鼠标被 warp 走、看门狗又把窗口压成透明 → 用户看到的就是“鼠标瞬移到左上、画面消失”）。
+                    // 不能用 EnableWindow(false)：点在被禁用的窗口上时 Windows 会“叮”一声（系统提示音）。
+                    // 改用 WS_EX_TRANSPARENT（命中测试穿透）：它自己收不到鼠标，点击直接落到下面的预览窗口，
+                    // 我们自己的缩放/双击手势照常工作，也没有任何提示音。
+                    try
+                    {
+                        int ex0 = GetWindowLong(target, -20);
+                        SetWindowLong(target, -20, ex0 | 0x20 /*WS_EX_TRANSPARENT*/ | 0x80 | 0x08000000);
+                    }
+                    catch { }
+                    // 先抢一次位置（异步、不改尺寸）：直接放到内容区里画面该落的地方，而不是屏幕外——
+                    // 屏幕外只能挡住“看得见”，挡不住 ffplay 自己又把自己挪回屏幕中央；放到内容区里则任何一帧都在帘子后面
+                    try { SetWindowPos(tg0, (IntPtr)(-1), _ffPinX, _ffPinY, 0, 0, 0x0001 | 0x0010); } catch { }
+                    System.Threading.Tasks.Task.Run(new Action(() =>
+                    {
+                        bool alphaOn = false;
+                        while (_suppressShow && !proc.HasExited)
+                        {
+                            try
+                            {
+                                if (!alphaOn)
+                                {
+                                    RECT cr0 = new RECT();
+                                    if (GetClientRect(tg0, out cr0))
+                                    {
+                                        int cw0 = cr0.Right - cr0.Left, ch0 = cr0.Bottom - cr0.Top;
+                                        if (cw0 > 8 && ch0 > 8 && !(cw0 == 640 && ch0 == 480))
+                                        {
+                                            // 客户区一到位就立刻压成全透明：之后 ffplay 再怎么 ShowWindow / 自我重设都是不可见的。
+                                            // 之前是先跳出循环再在外面设 alpha，中间那十几毫秒正是“闪一下”的来源。
+                                            SetLayeredAlpha(tg0, 0);
+                                            alphaOn = true;
+                                        }
+                                    }
+                                    // 透明之前干脆一直按着隐藏：隐藏窗口不参与合成，连一帧都画不出来
+                                    ShowWindow(tg0, 0);
+                                }
+                                // 仅改位置、不改尺寸：任何时候都按在内容区里画面该落的地方（帘子后面），绝不留在屏幕中央
+                                SetWindowPos(tg0, (IntPtr)(-1), _ffPinX, _ffPinY, 0, 0, 0x0001 /*NOSIZE*/ | 0x0010 /*NOACTIVATE*/);
+                                // 每轮重申 cloak：ffplay 自己那次 ShowWindow 之前它可能被重置，这一行保证它始终不参与合成
+                                if (!alphaOn) SetCloak(tg0, true);
+                                // 帘子每轮重新置顶：ffplay 自己也会抢到 topmost 最上层，不重申就会被它盖过去
+                                if (_curtainHwnd != IntPtr.Zero)
+                                {
+                                    IntPtr ch = _curtainHwnd;
+                                    SetWindowPos(ch, (IntPtr)(-1), 0, 0, 0, 0, 0x0001 /*NOSIZE*/ | 0x0002 /*NOMOVE*/ | 0x0010 /*NOACTIVATE*/);
+                                }
+                            }
+                            catch { }
+                            System.Threading.Thread.Sleep(1);
+                        }
+                    }));
+                    // 等它把客户区尺寸定下来（最长 1.5 秒），再由下面的 UI 定时器负责摆位/揭帘
+                    try
+                    {
+                        int waited = 0;
+                        while (waited < 1500)
+                        {
+                            if (proc.HasExited) return;
+                            RECT cr = new RECT();
+                            if (GetClientRect(target, out cr))
+                            {
+                                int cw2 = cr.Right - cr.Left, ch2 = cr.Bottom - cr.Top;
+                                if (cw2 > 8 && ch2 > 8 && !(cw2 == 640 && ch2 == 480)) break;
+                            }
+                            System.Threading.Thread.Sleep(10);
+                            waited += 10;
+                        }
+                    }
+                    catch { }
+                    try { SetLayeredAlpha(target, 0); } catch { }
+                    _embeddedHwnd = target;
+                    _ffSettling = true;
                     win.Dispatcher.BeginInvoke(new Action(() =>
                     {
-                        try { placeFfplay(target); }
+                        try
+                        {
+                            // ffplay 初始化尾声会自己按视频原始尺寸（如 2560×1440）把窗口重设一次并居中，那一下是它自己 ShowWindow，
+                            // 截不住也来不及藏。这里改用分层窗口：建窗后立刻 alpha=0，它整段初始化（包括那次自我重设/显示）都完全不可见；
+                            // 等它自己把窗口显示出来（WS_VISIBLE 变 true，说明视频已打开、尺寸也定下来了）再挪到内容区并恢复 alpha=255。
+                            SetLayeredAlpha(target, 0);
+                            // 等待期间在内容区给个加载提示，别让用户看着空棋盘格
+                            try
+                            {
+                                hint.Content = "正在加载动画…";
+                                hint.Visibility = Visibility.Visible;
+                            }
+                            catch { }
+                            // 校正思路：ffplay 初始化结束时会自己按视频原始尺寸重设并居中（此时 alpha=0，用户完全看不到）。
+                            // 我们每 80ms 把它按内容区摆回去一次，直到连续三次都“摆得住”（说明它不再自己动了）才 alpha→255；
+                            // 露出之后再用慢速表盯 8 秒，万一它又自己跳位/换尺寸，立刻重摆，用户最多看到一次极短的错位。
+                            int matched = 0;
+                            int t0 = Environment.TickCount;
+                            var tm = new System.Windows.Threading.DispatcherTimer();
+                            tm.Interval = TimeSpan.FromMilliseconds(80);
+                            tm.Tick += (s3, e3) =>
+                            {
+                                if (_embeddedHwnd != target) { tm.Stop(); _ffSettling = false; _suppressShow = false; return; }
+                                int el = Environment.TickCount - t0;
+                                // 先看看它此刻是什么矩形：ffplay 打开视频时会把自己按“视频原始像素尺寸”重设一次
+                                // （例如 2560×1440），这一次的宽高比就是视频真实比例，抓下来用于等比缩放
+                                RECT pre = new RECT();
+                                bool preOk = false;
+                                try { preOk = GetWindowRect(target, out pre); } catch { }
+                                if (preOk)
+                                {
+                                    int pw = pre.Right - pre.Left, ph = pre.Bottom - pre.Top;
+                                    var q0 = mediaHost.PointToScreen(new System.Windows.Point(0, 0));
+                                    var q1 = mediaHost.PointToScreen(new System.Windows.Point(mediaHost.ActualWidth, mediaHost.ActualHeight));
+                                    int cw = Math.Max(50, (int)Math.Round(q1.X - q0.X)), chh = Math.Max(50, (int)Math.Round(q1.Y - q0.Y));
+                                    if (pw > 16 && ph > 16 && _ffAspect <= 0)
+                                    {
+                                        double pa = pw / (double)ph;
+                                        // 我们自己摆的矩形就是内容区比例；出现别的比例只可能是 ffplay 那次“按视频像素尺寸重设”
+                                        if (Math.Abs(pa - cw / (double)chh) > 0.02) _ffAspect = pa;
+                                    }
+                                }
+                                // 只做“平移”，不改尺寸：ffplay 自己按 -x/-y/-vf 建好客户区后，谁再改尺寸都会让 SDL 视口错位。
+                                // 客户区还没到目标尺寸时（说明它还在初始化）先不动它，等它自己长到位；超过 2 秒仍不对才强制摆一次。
+                                RECT cl = new RECT();
+                                bool clOk = false;
+                                try { clOk = GetClientRect(target, out cl); } catch { }
+                                bool sizeReady = false;
+                                if (clOk)
+                                {
+                                    var w0 = mediaHost.PointToScreen(new System.Windows.Point(0, 0));
+                                    var w1 = mediaHost.PointToScreen(new System.Windows.Point(mediaHost.ActualWidth, mediaHost.ActualHeight));
+                                    int cwNow = Math.Max(50, (int)Math.Round(w1.X - w0.X)), chNow = Math.Max(50, (int)Math.Round(w1.Y - w0.Y));
+                                    int twWant = cwNow, thWant = chNow;
+                                    if (_ffAspect > 0.05)
+                                    {
+                                        if (cwNow / (double)chNow > _ffAspect) { thWant = chNow; twWant = Math.Max(8, (int)Math.Round(chNow * _ffAspect)); }
+                                        else { twWant = cwNow; thWant = Math.Max(8, (int)Math.Round(cwNow / _ffAspect)); }
+                                    }
+                                    sizeReady = Math.Abs((cl.Right - cl.Left) - twWant) <= 3 && Math.Abs((cl.Bottom - cl.Top) - thWant) <= 3;
+                                }
+                                if (sizeReady || el > 2000) placeFfplayCore(target, false); // 仍不可见（alpha=0）
+                                RECT now = new RECT();
+                                bool ok = false;
+                                try { ok = GetWindowRect(target, out now); } catch { }
+                                int tw = _ffTargetRect.Right - _ffTargetRect.Left, th = _ffTargetRect.Bottom - _ffTargetRect.Top;
+                                if (ok && Math.Abs(now.Left - _ffTargetRect.Left) <= 2 && Math.Abs(now.Top - _ffTargetRect.Top) <= 2
+                                    && Math.Abs((now.Right - now.Left) - tw) <= 2 && Math.Abs((now.Bottom - now.Top) - th) <= 2) matched++;
+                                else matched = 0;
+                                // 露出：稳定 3 拍且过了 1.2 秒就露；2.6 秒还没稳定也强制露一次（内容区还没布局完就再等一拍），
+                                // 避免某些时序下 matched 永远为 0，导致窗口一直停在 alpha=0、用户看到“闪一下然后画面消失”。
+                                if ((matched >= 3 && el > 1200) || el > 2600)
+                                {
+                                    if (mediaHost.ActualWidth < 20 || mediaHost.ActualHeight < 20) return;
+                                    tm.Stop();
+                                    _suppressShow = false; // 停止“反复隐藏”，从此由看门狗负责
+                                    _ffSettling = false;
+                                    placeFfplay(target);   // 摆到内容区并 alpha → 255
+                                    try { hookKeep.Stop(); } catch { } // 画面就位，钩子收工（不再抢着按回显示）
+                                    HideCurtain();         // 画面已就位，揭帘
+                                    try { hint.Visibility = Visibility.Collapsed; } catch { } // 画面出来了，收起加载提示
+                                    try { SetForegroundWindow(new WindowInteropHelper(win).Handle); } catch { }
+                                    // 常驻校正：只要这个叠放窗口还在，就一直盯着它；它自己再改尺寸/位置就按内容区摆回去。
+                                    // 之前只盯 8 秒，超时后 ffplay 再自我重设就会变成一个横跨屏幕的大窗口压在别的程序上。
+                                    // 再加一层 15ms 后台看门狗：ffplay 有时在视频真正开播之后（约 2~3 秒）还会自己重设一次
+                                    // （实测出现过 640×480 出现在 640,300，或按视频像素尺寸 2560×1440 铺满整屏），
+                                    // 250ms 的 UI 定时器来不及，那一瞬就是用户看到的“全屏闪一下”。看门狗一旦发现矩形不对，
+                                    // 立刻压成全透明并异步摆回内容区——全部是非阻塞调用，不会卡住 UI。
+                                    IntPtr tg = target;
+                                    int tgtW = _ffTargetRect.Right - _ffTargetRect.Left, tgtH = _ffTargetRect.Bottom - _ffTargetRect.Top;
+                                    System.Threading.Tasks.Task.Run(new Action(() =>
+                                    {
+                                        while (_embeddedHwnd == tg)
+                                        {
+                                            try
+                                            {
+                                                if (proc.HasExited) break;
+                                                RECT wr = new RECT();
+                                                if (GetWindowRect(tg, out wr))
+                                                {
+                                                    int ww = wr.Right - wr.Left, wh = wr.Bottom - wr.Top;
+                                                    if (ww < 1 || wh < 1 || Math.Abs(ww - tgtW) > 2 || Math.Abs(wh - tgtH) > 2
+                                                        || Math.Abs(wr.Left - _ffTargetRect.Left) > 2 || Math.Abs(wr.Top - _ffTargetRect.Top) > 2)
+                                                    {
+                                                        SetLayeredAlpha(tg, 0);
+                                                        SetWindowPos(tg, (IntPtr)(-1), _ffTargetRect.Left, _ffTargetRect.Top, tgtW, tgtH,
+                                                            0x0010 /*NOACTIVATE*/ | 0x4000 /*ASYNCWINDOWPOS*/);
+                                                    }
+                                                }
+                                            }
+                                            catch { }
+                                            System.Threading.Thread.Sleep(15);
+                                        }
+                                    }));
+                                    var mo = new System.Windows.Threading.DispatcherTimer();
+                                    mo.Interval = TimeSpan.FromMilliseconds(250);
+                                    mo.Tick += (s4, e4) =>
+                                    {
+                                        if (_embeddedHwnd != target) { mo.Stop(); return; }
+                                        if (!IsWindow(target)) { mo.Stop(); return; }
+                                        RECT r2 = new RECT();
+                                        bool ok2 = false;
+                                        try { ok2 = GetWindowRect(target, out r2); } catch { }
+                                        if (!ok2) { mo.Stop(); return; }
+                                        int tw2 = _ffTargetRect.Right - _ffTargetRect.Left, th2 = _ffTargetRect.Bottom - _ffTargetRect.Top;
+                                        if (Math.Abs(r2.Left - _ffTargetRect.Left) > 2 || Math.Abs(r2.Top - _ffTargetRect.Top) > 2
+                                            || Math.Abs((r2.Right - r2.Left) - tw2) > 2 || Math.Abs((r2.Bottom - r2.Top) - th2) > 2)
+                                        {
+                                            // 先把透明度压回 0 再摆，避免把“跳位过程”露出来
+                                            try { SetLayeredAlpha(target, 0); } catch { }
+                                            placeFfplayCore(target, false);
+                                            try
+                                            {
+                                                bool k3 = GetWindowRect(target, out r2);
+                                                int tw4 = _ffTargetRect.Right - _ffTargetRect.Left, th4 = _ffTargetRect.Bottom - _ffTargetRect.Top;
+                                                if (k3 && Math.Abs(r2.Left - _ffTargetRect.Left) <= 2 && Math.Abs(r2.Top - _ffTargetRect.Top) <= 2
+                                                    && Math.Abs((r2.Right - r2.Left) - tw4) <= 2 && Math.Abs((r2.Bottom - r2.Top) - th4) <= 2)
+                                                    RevealNative(target);
+                                                    HideCurtain();
+                                            }
+                                            catch { }
+                                        }
+                                    };
+                                    mo.Start();
+                                }
+                            };
+                            tm.Start();
+                        }
                         catch
                         {
                             // 定位失败：恢复提示，告知正在外置窗口播放
@@ -2599,15 +3162,29 @@ namespace PickLight
                 watch(proc);
             };
 
+            // 切到别的程序时把叠放的 ffplay 一起藏掉（全透明），否则它会浮在别的窗口上面；
+            // 回到预览窗口再按内容区重新叠放并恢复不透明
+            win.Deactivated += (s2, e2) => { if (_embeddedHwnd != IntPtr.Zero) { IntPtr h6 = _embeddedHwnd; try { SetLayeredAlpha(h6, 0); } catch { } } };
+            win.Activated += (s2, e2) => { if (_embeddedHwnd != IntPtr.Zero) { IntPtr h3 = _embeddedHwnd; bool sk = _ffSettling; win.Dispatcher.BeginInvoke(new Action(() => placeFfplayCore(h3, !sk))); } };
+
             // 弹窗移动/缩放时同步叠放的 ffplay 窗口位置与尺寸
-            win.LocationChanged += (s2, e2) => { if (_embeddedHwnd != IntPtr.Zero) win.Dispatcher.BeginInvoke(new Action(() => placeFfplay(_embeddedHwnd))); };
-            win.SizeChanged += (s2, e2) => { if (_embeddedHwnd != IntPtr.Zero) win.Dispatcher.BeginInvoke(new Action(() => placeFfplay(_embeddedHwnd))); };
+            win.LocationChanged += (s2, e2) => { if (_embeddedHwnd != IntPtr.Zero) { IntPtr h4 = _embeddedHwnd; bool sk2 = _ffSettling; win.Dispatcher.BeginInvoke(new Action(() => placeFfplayCore(h4, !sk2))); } };
+            win.SizeChanged += (s2, e2) => { if (_embeddedHwnd != IntPtr.Zero) { IntPtr h5 = _embeddedHwnd; bool sk3 = _ffSettling; win.Dispatcher.BeginInvoke(new Action(() => placeFfplayCore(h5, !sk3))); } };
+
+            // 预览期间装低级鼠标钩子：落在 ffplay 矩形内的点击/双击/滚轮在到达它之前就被吃掉。
+            // 这样它既不会暂停、也不会切全屏把鼠标 warp 走；也不用 EnableWindow 禁用（那会响系统提示音）。
+            try
+            {
+                if (_mouseShield == null) _mouseShield = new MouseShield(() => _embeddedHwnd);
+                _mouseShield.Install();
+            }
+            catch { }
 
             // 图片初始展示：等图片完全解码后完整适配查看区（大图自动缩小到全部可见，小图原始尺寸居中）。
             // 打开与切换上下页均走此处；用户可放大到 100% 看细节，超出后拖动平移。
             // 弹窗刚打开时 svImg 可能尚未完成布局（ActualWidth=0），此时延迟到下一帧重试。
             int fitRetry = 0;
-            Action<BitmapImage> fitImage = null;
+            Action<BitmapSource> fitImage = null;
             fitImage = (bmp) =>
             {
                 // 用 Width/Height（WPF 按图片 DPI 换算后的 DIP 尺寸）而非 PixelWidth/Height（物理像素）：
@@ -2871,6 +3448,9 @@ namespace PickLight
                     try { if (!old.HasExited) old.Kill(); } catch { }
                 }
                 _embeddedHwnd = IntPtr.Zero;
+                _ffAspect = 0;
+                try { if (_ffHook != null) { _ffHook.Stop(); _ffHook = null; } } catch { } // 切项/关闭时把窗口钩子一并收掉，避免后台线程一直泵消息
+                HideCurtain(); // 切到别的项（静态图/视频）时把上一次的加载帘收掉，避免留下白块
                 var item = items[nav];
                 bool isMedia = (item.Type == "视频" || item.Type == "音频");
                 win.Title = "预览  " + (item.Time ?? "") + "  " + (item.Source ?? "") + "  (" + (nav + 1) + "/" + items.Count + ")";
@@ -2896,7 +3476,9 @@ namespace PickLight
                 }
                 else
                 {
-                    hint.Visibility = Visibility.Collapsed; // 图片加载期间旧图保持显示，无"加载中"闪烁
+                    // 图片加载期间旧图保持显示，无"加载中"闪烁；但首次进入/没有旧图时内容区是空的，给个加载提示
+                    if (img.Source == null) { hint.Content = "加载中…"; hint.Visibility = Visibility.Visible; }
+                    else hint.Visibility = Visibility.Collapsed;
                 }
                 fitRetry = 0;
                 _imgDrag = false;
@@ -3020,6 +3602,73 @@ namespace PickLight
                                     win.Dispatcher.BeginInvoke(new Action(() =>
                                     {
                                         if (curNav != nav) return;
+                                        // —— 首选：在 WPF 里原生逐帧播放 ——
+                                        // ffplay 是独立顶层窗口，初始化尾声必然自己 SDL_ShowWindow 一次（屏幕居中），
+                                        // 而跨线程的隐藏/透明调用要等它线程忙完才生效，所以总会漏出一帧——这就是反复出现的“闪一下”。
+                                        // 本机 WIC 能直接解码动态 webp（多帧 Bgra32、含透明通道），干脆不借窗口：
+                                        // 与静态图共用同一个 Image 控件和 contain/缩放/棋盘格，逐像素透明也天然正确。
+                                        bool played = false;
+                                        try
+                                        {
+                                            var dec = BitmapDecoder.Create(new MemoryStream(data),
+                                                BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                                            var frames = dec.Frames;
+                                            if (frames != null && frames.Count > 0)
+                                            {
+                                                int[] delays = WebpFrameDelays(data, frames.Count);
+                                                img.Visibility = Visibility.Visible;
+                                                hint.Visibility = Visibility.Collapsed;
+                                                img.Source = (BitmapSource)frames[0];
+                                                fitImage((BitmapSource)frames[0]);
+                                                if (frames.Count > 1)
+                                                {
+                                                    _pvDetailHost.Visibility = Visibility.Collapsed; // 动画无固定静态画面，详情卡片隐藏
+                                                    int fi = 0;
+                                                    var tm2 = new System.Windows.Threading.DispatcherTimer();
+                                                    tm2.Tick += (a3, b3) =>
+                                                    {
+                                                        if (curNav != nav || img.Source == null) { tm2.Stop(); return; }
+                                                        int nf = frames.Count;
+                                                        fi = (fi + 1) % nf;
+                                                        img.Source = (BitmapSource)frames[fi];
+                                                        tm2.Interval = TimeSpan.FromMilliseconds(delays[fi]);
+                                                        if (fi == 0) fitImage((BitmapSource)frames[0]); // 一轮结束按首帧重量一次尺寸
+                                                    };
+                                                    tm2.Interval = TimeSpan.FromMilliseconds(delays[0]);
+                                                    tm2.Start();
+                                                    played = true;
+                                                }
+                                                else
+                                                {
+                                                    // 单帧（不少“动态 webp”其实只有一帧，如本项目的启动器缓存）：当静态图处理，但补上帧数说明
+                                                    var f0 = frames[0];
+                                                    var pairs = new List<KeyValuePair<string, string>>();
+                                                    pairs.Add(new KeyValuePair<string, string>("分辨率", f0.PixelWidth + " × " + f0.PixelHeight));
+                                                    pairs.Add(new KeyValuePair<string, string>("格式", "WEBP"));
+                                                    pairs.Add(new KeyValuePair<string, string>("大小", data.Length >= 1048576 ? (data.Length / 1048576.0).ToString("0.0") + " MB" : (data.Length / 1024.0).ToString("0") + " KB"));
+                                                    pairs.Add(new KeyValuePair<string, string>("帧", "1 帧（静态图）"));
+                                                    _pvDetailGrid.Children.Clear();
+                                                    _pvDetailGrid.RowDefinitions.Clear();
+                                                    var textSec2 = (Brush)FindResource("TextSecondary");
+                                                    var textPri2 = (Brush)FindResource("TextPrimary");
+                                                    for (int i2 = 0; i2 < pairs.Count; i2++)
+                                                    {
+                                                        _pvDetailGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                                                        var lb2 = new TextBlock { Text = pairs[i2].Key, FontSize = 13.5, Foreground = textSec2, TextAlignment = TextAlignment.Right, Margin = new Thickness(0, 0, 18, 5), VerticalAlignment = VerticalAlignment.Top };
+                                                        var vb2 = new TextBlock { Text = pairs[i2].Value, FontSize = 13.5, Foreground = textPri2, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 5), VerticalAlignment = VerticalAlignment.Top };
+                                                        Grid.SetRow(lb2, i2); Grid.SetColumn(lb2, 0);
+                                                        Grid.SetRow(vb2, i2); Grid.SetColumn(vb2, 1);
+                                                        _pvDetailGrid.Children.Add(lb2);
+                                                        _pvDetailGrid.Children.Add(vb2);
+                                                    }
+                                                    _pvDetailHost.Visibility = Visibility.Visible;
+                                                    played = true;
+                                                }
+                                            }
+                                        }
+                                        catch { played = false; }
+                                        if (played) return;
+                                        // —— 兜底：本机解码不了才退回 ffplay 伪嵌入 ——
                                         string ffplay = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffplay.exe");
                                         if (System.IO.File.Exists(ffplay))
                                         {
@@ -3027,14 +3676,68 @@ namespace PickLight
                                             {
                                                 img.Visibility = Visibility.Collapsed;
                                                 _pvDetailHost.Visibility = Visibility.Collapsed; // 动画图走 ffplay，无静态画面，详情卡片隐藏
-                                                var pr = LaunchFfplay(ffplay, url, item.Source, true);
+                                                // 字节已经在内存里，先落成本地临时副本再交给 ffplay 播放：
+                                                // 否则 ffplay 要再走一次网络，弱网时首帧要等十几秒，内容区一直是空白
+                                                string localCopy = url;
+                                                try
+                                                {
+                                                    string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "PickLightPreview");
+                                                    if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+                                                    localCopy = System.IO.Path.Combine(dir, "anim_" + Math.Abs(url.GetHashCode()) + ".webp");
+                                                    System.IO.File.WriteAllBytes(localCopy, data);
+                                                }
+                                                catch { localCopy = url; }
+                                                // 宽高比直接从字节里解码首帧得到，不依赖 ffplay 那次自我重设：
+                                                // ffplay 会把画面拉伸铺满它自己的窗口，给错比例就会把 16:9 的动画挤扁
+                                                try
+                                                {
+                                                    using (var ms0 = new MemoryStream(data))
+                                                    {
+                                                        var dec = BitmapDecoder.Create(ms0, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                                                        if (dec.Frames.Count > 0)
+                                                        {
+                                                            var f0 = dec.Frames[0];
+                                                            if (f0.PixelWidth > 8 && f0.PixelHeight > 8) _ffAspect = f0.PixelWidth / (double)f0.PixelHeight;
+                                                        }
+                                                    }
+                                                }
+                                                catch { }
+                                                // 目标尺寸：内容区的设备像素大小，再按视频宽高比 contain（与 placeFfplayCore 用同一套算法）
+                                                // 注意：必须先让 mediaHost 参与布局再量尺寸——它默认是 Collapsed，量出来是 0，
+                                                // 会退化成 50x28 传给 -vf，结果 ffplay 把画面缩成一个指甲盖大小的缩略图。
+                                                int ew = 0, eh = 0;
+                                                try
+                                                {
+                                                    mediaHost.Visibility = Visibility.Visible;
+                                                    win.UpdateLayout();
+                                                    System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(
+                                                        new Action(() => { }), System.Windows.Threading.DispatcherPriority.Loaded);
+                                                }
+                                                catch { }
+                                                try
+                                                {
+                                                    var q0 = mediaHost.PointToScreen(new System.Windows.Point(0, 0));
+                                                    var q1 = mediaHost.PointToScreen(new System.Windows.Point(mediaHost.ActualWidth, mediaHost.ActualHeight));
+                                                    int cw = Math.Max(50, (int)Math.Round(q1.X - q0.X));
+                                                    int chh = Math.Max(50, (int)Math.Round(q1.Y - q0.Y));
+                                                    ew = cw; eh = chh;
+                                                    if (_ffAspect > 0.05)
+                                                    {
+                                                        if (cw / (double)chh > _ffAspect) { eh = chh; ew = Math.Max(8, (int)Math.Round(chh * _ffAspect)); }
+                                                        else { ew = cw; eh = Math.Max(8, (int)Math.Round(cw / _ffAspect)); }
+                                                    }
+                                                }
+                                                catch { }
+                                                ShowCurtain(); // 先把内容区盖住，ffplay 自己那一下 ShowWindow 就不会闪出来
+                                                var pr = LaunchFfplay(ffplay, localCopy, item.Source, true, ew, eh);
                                                 _currentFfplay = pr;
                                                 startEmbedded(pr, true);
-                                                hint.Content = "▶ 动画图片，正在播放中（循环播放）";
-                                                hint.Visibility = Visibility.Collapsed;
+                                                hint.Content = "正在加载动画…";
+                                                hint.Visibility = Visibility.Visible;
                                             }
                                             catch
                                             {
+                                                HideCurtain();
                                                 mediaHost.Visibility = Visibility.Collapsed;
                                                 hint.Content = "启动 ffplay 播放动画图片失败。";
                                                 hint.Visibility = Visibility.Visible;
@@ -3159,6 +3862,7 @@ namespace PickLight
                     // 动画 webp 用伪嵌入叠放内容区，其余外置窗口
                     bool embed = lowerUrl.EndsWith(".webp");
                     if (embed) img.Visibility = Visibility.Collapsed;
+                    if (embed) ShowCurtain(); // 同上：动画 webp 的内嵌播放先盖帘再启动 ffplay
                     var pr = LaunchFfplay(ffp, curItem.Url, curItem.Source, embed);
                     _currentFfplay = pr;
                     startEmbedded(pr, embed);
@@ -3167,6 +3871,7 @@ namespace PickLight
                 }
                 catch
                 {
+                    HideCurtain();
                     hint.Content = "启动 ffplay 失败。点「🌐 浏览器打开」或「⬇ 下载」查看。";
                 }
             };
@@ -3244,6 +3949,9 @@ namespace PickLight
             // 弹窗关闭：停止当前播放（ffplay/MediaElement 一并清理，不留残留窗口），并重新激活主窗口
             win.Closed += (s, e) =>
             {
+                try { if (_mouseShield != null) { _mouseShield.Uninstall(); _mouseShield = null; } } catch { }
+                try { if (_ffHook != null) { _ffHook.Stop(); _ffHook = null; } } catch { }
+                try { HideCurtain(); } catch { }
                 if (_currentMedia != null)
                 {
                     try { _currentMedia.Stop(); _currentMedia.Source = null; } catch { }
@@ -3256,6 +3964,7 @@ namespace PickLight
                     try { if (!old.HasExited) old.Kill(); } catch { }
                 }
                 _embeddedHwnd = IntPtr.Zero;
+                _ffAspect = 0;
                 _previewWindow = null;
                 try { Activate(); } catch { }
             };
@@ -3835,6 +4544,168 @@ namespace PickLight
         #endregion
     }
 
+    // ffplay 附属窗口的"出生即隐藏"钩子：SDL 窗口创建后会立刻以默认尺寸出现在屏幕中央，
+    // 只靠 Process.MainWindowHandle 轮询通常晚 100ms 左右，用户就会看到一次闪窗。
+    // 这里用 WinEvent 钩子在窗口创建/显示的第一时间把它藏掉，并摘掉任务栏按钮、禁止抢键盘焦点；
+    // 叠放到预览内容区之后再由调用方显示出来。
+    class FfplayHideHook
+    {
+        // 本类自带一份声明（主窗口里的同名成员是私有的，这里不依赖外部）
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr SetWinEventHook(int min, int max, IntPtr hmod, WinEventProc proc, int pid, int tid, int flags);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool UnhookWinEvent(IntPtr hook);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int GetWindowThreadProcessId(IntPtr hwnd, out int pid);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int GetWindowLong(IntPtr hwnd, int index);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int SetWindowLong(IntPtr hwnd, int index, int value);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hwnd, int cmd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte alpha, uint flags);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool PeekMessage(out MSG msg, IntPtr hwnd, int min, int max, int remove);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool TranslateMessage(ref MSG msg);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr DispatchMessage(ref MSG msg);
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct MSG
+        {
+            public IntPtr hwnd;
+            public int message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public int time;
+            public int ptX;
+            public int ptY;
+            public int lPrivate;
+        }
+
+        readonly int _pid;
+        readonly WinEventProc _proc; // 必须保留委托引用，否则会被 GC 回收导致钩子失效
+        IntPtr _hook = IntPtr.Zero;
+        public IntPtr Handle = IntPtr.Zero;
+        // 校正阶段为 true：ffplay 初始化尾声自己 SDL_ShowWindow 的那一次也会被立刻按回去（事件级，不必等 40ms 定时器）
+        public static bool KeepHidden = false;
+        // 内容区内画面该落的位置（设备像素）。建窗/自发显示时把窗口按到这里，任何一帧都只可能出现在内容区内。
+        public int TargetX = int.MinValue;
+        public int TargetY = int.MinValue;
+        // 已拿到句柄后由 UI 线程重新挂的钩子：拦截到 ffplay 自己的显示事件时回调，让宿主当场挪位并重新隐藏
+        public Action<IntPtr> OnShown;
+
+        public FfplayHideHook(int pid)
+        {
+            _pid = pid;
+            _proc = OnWindowEvent;
+        }
+
+        // 直接接管一个已知窗口（用于后台线程拿到句柄后转交 UI 线程的钩子，避免重复枚举）
+        public void Attach(IntPtr hwnd)
+        {
+            Handle = hwnd;
+        }
+
+        public void Start()
+        {
+            _hook = SetWinEventHook(0x8000 /*EVENT_OBJECT_CREATE*/, 0x8002 /*EVENT_OBJECT_SHOW*/, IntPtr.Zero, _proc, 0, 0, 0 /*WINEVENT_OUTOFCONTEXT*/);
+        }
+
+        void OnWindowEvent(IntPtr hook, int ev, IntPtr hwnd, int idObject, int idChild, int threadId, int time)
+        {
+            if (hwnd == IntPtr.Zero || idObject != 0) return;
+            int pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (pid != _pid) return;
+            if (Handle != IntPtr.Zero)
+            {
+                if (KeepHidden && hwnd == Handle)
+                {
+                    if (ev == 0x8002 /*EVENT_OBJECT_SHOW*/ && OnShown != null) { try { OnShown(hwnd); } catch { } }
+                    else { try { ShowWindow(Handle, 0); } catch { } }
+                }
+                return;
+            }
+            RECT r;
+            if (!GetWindowRect(hwnd, out r)) return;
+            // 只认真正的播放窗口（初始 640×480 或 -x/-y 指定尺寸），跳过 0×0 / 1×1 的 IME 与辅助窗口
+            if (r.Right - r.Left < 100 || r.Bottom - r.Top < 100) return;
+            try
+            {
+                ShowWindow(hwnd, 0); // SW_HIDE
+                // 只改“无任务栏 + 不抢焦点”，千万不要在这里加 WS_EX_LAYERED：
+                // 建窗阶段被改成分层窗口，SDL 的初始化会被打断，客户区将永远停在 640×480，画面再也对不上。
+                int ex = GetWindowLong(hwnd, -20); // GWL_EXSTYLE
+                SetWindowLong(hwnd, -20, ex | 0x80 /*TOOLWINDOW：无任务栏按钮*/ | 0x08000000 /*NOACTIVATE：不抢焦点*/);
+            }
+            catch { }
+            PinPos(hwnd);
+            Handle = hwnd;
+        }
+
+        // 把窗口按到内容区位置（只改位置不改尺寸）；还不知道目标位置时挪到屏幕外
+        public void PinPos(IntPtr hwnd)
+        {
+            try
+            {
+                if (TargetX != int.MinValue && TargetY != int.MinValue)
+                    SetWindowPos(hwnd, (IntPtr)(-1), TargetX, TargetY, 0, 0, 0x0001 /*NOSIZE*/ | 0x0010 /*NOACTIVATE*/);
+                else
+                    SetWindowPos(hwnd, (IntPtr)(-1), -3000, -3000, 0, 0, 0x0001 | 0x0010);
+            }
+            catch { }
+        }
+
+        // 钩子回调要到本线程的消息循环才会被派发，这里跑 PeekMessage 直到拿到窗口句柄或超时
+        public IntPtr WaitReady(int timeoutMs)
+        {
+            int start = Environment.TickCount;
+            while (Handle == IntPtr.Zero && Environment.TickCount - start < timeoutMs)
+            {
+                Pump();
+                if (Handle != IntPtr.Zero) break;
+                System.Threading.Thread.Sleep(1);
+            }
+            // 拿到句柄后继续在后台泵消息：ffplay 初始化尾声那次 SDL_ShowWindow 也要靠这个循环才能及时收到
+            if (Handle != IntPtr.Zero)
+            {
+                IntPtr h = Handle;
+                System.Threading.Tasks.Task.Run(new Action(() =>
+                {
+                    while (Handle == h && _hook != IntPtr.Zero)
+                    {
+                        Pump();
+                        System.Threading.Thread.Sleep(1);
+                    }
+                }));
+            }
+            return Handle;
+        }
+
+        void Pump()
+        {
+            MSG msg;
+            while (PeekMessage(out msg, IntPtr.Zero, 0, 0, 1 /*PM_REMOVE*/))
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+        }
+
+        public void Stop()
+        {
+            if (_hook != IntPtr.Zero) { try { UnhookWinEvent(_hook); } catch { } _hook = IntPtr.Zero; }
+        }
+    }
+
     // 输入框焦点治理：所有带输入框的窗口（主窗口 / 选择导入记录 / 管理记录 / 预览）共用这一套规则，
     // 不再每个窗口各写一份，避免"主界面正常、弹窗里点空白后还在打字"这类不一致
     // 1) 文本框获焦 → 恢复本窗口的输入法；文本框失焦 → 断开本窗口输入法（候选窗不再吞快捷键）
@@ -4234,4 +5105,94 @@ namespace PickLight
             app.Run(new MainWindow());
         }
     }
+
+    // 低级鼠标钩子：叠放的 ffplay 是 player 窗口，鼠标落在它上面时单击=暂停、双击=切全屏（会截整屏并 warp 鼠标），
+    // 而它又在最前面，我们的预览窗口收不到这些点击。不能用 EnableWindow(false) 禁用它——点在被禁用的窗口上
+    // Windows 会“叮”一声。所以改在这里按矩形把落在 ffplay 上的点击/滚轮吃掉，两边都收不到，也不出声。
+    class MouseShield
+    {
+        delegate IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        static extern IntPtr SetWindowsHookEx(int idHook, MouseProc lpfn, IntPtr hMod, uint dwThreadId);
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        static extern bool UnhookWindowsHookEx(IntPtr hhk);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool IsWindow(IntPtr hwnd);
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct MSLLHOOKSTRUCT
+        {
+            public int x;
+            public int y;
+            public int mouseData;
+            public int flags;
+            public int time;
+            public IntPtr dwExtraInfo;
+        }
+
+        const int WH_MOUSE_LL = 14;
+        readonly Func<IntPtr> _target;
+        IntPtr _hook = IntPtr.Zero;
+        MouseProc _proc; // 保留引用，否则回调被回收后崩溃
+
+        public MouseShield(Func<IntPtr> target) { _target = target; }
+
+        public void Install()
+        {
+            if (_hook != IntPtr.Zero) return;
+            _proc = new MouseProc(Callback);
+            _hook = SetWindowsHookEx(WH_MOUSE_LL, _proc, IntPtr.Zero, 0);
+        }
+
+        public void Uninstall()
+        {
+            if (_hook == IntPtr.Zero) return;
+            try { UnhookWindowsHookEx(_hook); } catch { }
+            _hook = IntPtr.Zero;
+            _proc = null;
+        }
+
+        IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                if (nCode >= 0)
+                {
+                    int wp = wParam.ToInt32();
+                    // 只处理按钮与滚轮；移动（0x200）放行，否则 ffplay 拿不到 hover 无所谓但会拖慢系统
+                    if (wp == 0x201 || wp == 0x202 || wp == 0x203          // 左键 down/up/dblclk
+                        || wp == 0x204 || wp == 0x205 || wp == 0x206      // 右键
+                        || wp == 0x207 || wp == 0x208 || wp == 0x209      // 中键
+                        || wp == 0x20A || wp == 0x20E)                    // 滚轮 / 横向滚轮
+                    {
+                        IntPtr tg = _target();
+                        if (tg != IntPtr.Zero && IsWindow(tg))
+                        {
+                            RECT r;
+                            if (GetWindowRect(tg, out r))
+                            {
+                                MSLLHOOKSTRUCT m = (MSLLHOOKSTRUCT)System.Runtime.InteropServices.Marshal.PtrToStructure(
+                                    lParam, typeof(MSLLHOOKSTRUCT));
+                                if (m.x >= r.Left && m.x < r.Right && m.y >= r.Top && m.y < r.Bottom)
+                                {
+                                    return (IntPtr)1; // 吃掉：ffplay 不会暂停/全屏，也不会响提示音
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return CallNextHookEx(_hook, nCode, wParam, lParam);
+        }
+    }
 }
+
